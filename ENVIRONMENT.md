@@ -86,12 +86,15 @@
 | 内置 skill 定义 | `backend/skills/` |
 | 本地 embedding 模型 | `models/bge-small-zh-v1.5/` |
 
-## 七、一键启动脚本
+## 七、一键安装脚本
 
 | 脚本 | 用途 |
 |---|---|
+| `setup.cmd` / `setup.ps1` | 一次下载所有依赖（npm + pip；`setup.ps1 -WithRag` 额外装 RAG 模型） |
 | `start-dev.cmd` / `start-dev.ps1` | 一次启动前后端（释放端口 8000/5173，分别开窗） |
 | `stop-dev.cmd` / `stop-dev.ps1` | 停止前后端 |
 
+- 首次部署：双击 `setup.cmd`（基础依赖）；如需语义检索再运行 `setup.ps1 -WithRag`。
+- 模型下载脚本：`backend/download_model.py`（bge-small-zh-v1.5，经 hf-mirror 分段下载+断点续传）。
 - 后端：`python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`（在 `backend/` 目录）
 - 前端：`npm run dev`（Vite，访问 `http://localhost:5173`，注意用 `localhost` 而非 `127.0.0.1`）
