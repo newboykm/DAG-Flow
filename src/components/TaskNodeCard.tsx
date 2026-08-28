@@ -1,0 +1,783 @@
+import { useEffect, useRef, useState } from 'react';
+import { useGraphStore } from '../store/useGraphStore';
+import { STATUS_META } from '../graph/statusMeta';
+import { api } from '../api';
+import type { AppendMode, DagNode } from '../types';
+
+const MODE_LABEL: Record<AppendMode, string> = { serial: '串行', parallel: '并行', join: 'join' };
+
+interface Props {
+  node: DagNode;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  collapsed: boolean;
+  isAnchor: boolean;
+  dim: boolean;
+  sourceSelected?: boolean;
+  zoomed?: boolean;
+  /** 放大补偿系数（1/scale）：如 2 倍放大传 0.5，铺满画布传 1/k */
+  zoomComp?: number;
+  childrenCount: number;
+  /** 是否渲染在窗口（card-window）内：隐藏自己的 resize 手柄，由窗口层统一处理 */
+  inWindow?: boolean;
+}
+
+export default function TaskNodeCard(props: Props) {
+  const { node, x, y, width, height, collapsed, isAnchor, dim, sourceSelected, zoomed, zoomComp, childrenCount, inWindow } = props;
+  const meta = STATUS_META[node.status];
+  const clickTimer = useRef<number | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(node.title);
+  const [draft, setDraft] = useState('');
+  const chatRef = useRef<HTMLDivElement>(null);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const dragRef = useRef<{ sx: number; sy: number; moved: boolean; anchor: 'title' | 'card' } | null>(null);
+  const resizeRef = useRef<{ sx: number; sy: number; w: number; h: number } | null>(null);
+
+  const closeMenu = () => setMenu(null);
+
+  const commitTitle = () => {
+    if (titleDraft.trim()) useGraphStore.getState().updateNodeTitle(node.nodeId, titleDraft);
+    setEditingTitle(false);
+  };
+
+  const sendChat = () => {
+    const text = draft.trim();
+    if (!text) return;
+    useGraphStore.getState().sendMessage(node.nodeId, text);
+    setDraft('');
+    if (inputRef.current) {
+      inputRef.current.style.height = 'auto';
+    }
+  };
+
+  // 展开态右下角手柄：拖动调整宽高（按下拖动、松开停止）
+  const onResizePointerDown = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    // 不 preventDefault，避免阻断 pointerup 派发
+    const w = node.customSize?.width ?? width;
+    const h = node.customSize?.height ?? height;
+    resizeRef.current = { sx: e.clientX, sy: e.clientY, w, h };
+    const finish = () => {
+      if (!resizeRef.current) return;
+      resizeRef.current = null;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', finish);
+      window.removeEventListener('pointercancel', finish);
+      // 拖动结束持久化最终尺寸
+      const finalNode = useGraphStore.getState().nodes[node.nodeId];
+      if (finalNode?.customSize) {
+        api.updateNode(node.nodeId, { customSize: finalNode.customSize }).catch(() => {});
+      }
+    };
+    const move = (ev: PointerEvent) => {
+      const r = resizeRef.current;
+      if (!r) return;
+      const nw = r.w + (ev.clientX - r.sx);
+      const nh = r.h + (ev.clientY - r.sy);
+      useGraphStore.getState().resizeNode(node.nodeId, nw, nh);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', finish);
+    window.addEventListener('pointercancel', finish);
+  };
+
+  // 展开态右下角手柄：拖动调整宽高（已在 onResizePointerDown 内用原生监听处理）
+
+  // 新消息时滚动到底部
+  useEffect(() => {
+    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight });
+  }, [node.messages?.length]);
+
+  // 展开态：卡片内滚轮直接滚动消息列表，阻止冒泡到画布缩放
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el || collapsed) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const chat = chatRef.current;
+      if (chat) chat.scrollTop += e.deltaY;
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [collapsed]);
+
+  useEffect(() => {
+    if (!menu) return;
+    // 用 mousedown 关闭（点击菜单外），避免 document click 与 React onClick 竞态导致按钮 action 不执行
+    const onDocMouseDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && el.closest('.ctx-menu')) return; // 点在菜单内部不关
+      setMenu(null);
+    };
+    document.addEventListener('mousedown', onDocMouseDown);
+    return () => document.removeEventListener('mousedown', onDocMouseDown);
+  }, [menu]);
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // 相对卡片定位（避免 Portal/fixed 在 transform 缩放容器下的坐标错乱）
+    const rect = cardRef.current?.getBoundingClientRect();
+    if (rect) {
+      setMenu({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    } else {
+      setMenu({ x: 0, y: 0 });
+    }
+  };
+
+  // 单击=设锚点（延迟以区分双击）；双击=展开/收起（§5.2 交互决议）
+  // 选源模式下：点击立即切换选中，取消延迟，反馈即时
+  const handleClick = () => {
+    if (inWindow) return; // 窗口内单击不设 DAG 锚点
+    if (useGraphStore.getState().selectingSource) {
+      useGraphStore.getState().clickNode(node.nodeId);
+      return;
+    }
+    if (clickTimer.current != null) window.clearTimeout(clickTimer.current);
+    clickTimer.current = window.setTimeout(() => {
+      useGraphStore.getState().clickNode(node.nodeId);
+    }, 240);
+  };
+
+  const handleDoubleClick = () => {
+    if (clickTimer.current != null) {
+      window.clearTimeout(clickTimer.current);
+      clickTimer.current = null;
+    }
+    // 双击开/关窗口（多窗口）：打开时用画布可视区尺寸作为初始铺满大小
+    const canvasEl = document.querySelector('.canvas') as HTMLElement | null;
+    const cw = canvasEl?.clientWidth ?? window.innerWidth;
+    const ch = canvasEl?.clientHeight ?? window.innerHeight;
+    const rect = {
+      x: 24,
+      y: 24,
+      width: Math.max(320, cw - 48),
+      height: Math.max(300, ch - 48),
+    };
+    useGraphStore.getState().toggleWindow(node.nodeId, rect);
+  };
+
+  // 拖动：按住卡片（标题栏优先）横向拖拽，移动超过阈值后整卡跟随
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (inWindow) return; // 窗口内卡片由窗口标题栏统一拖动，不启用卡片自身拖动
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
+    const inTitle = !!(e.target as HTMLElement).closest('.card-head');
+    dragRef.current = { sx: e.clientX, sy: e.clientY, moved: false, anchor: inTitle ? 'title' : 'card' };
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.sx;
+    const dy = e.clientY - d.sy;
+    if (!d.moved && Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+    if (d.moved) {
+      useGraphStore.getState().moveNode(node.nodeId, dx, dy);
+      d.sx = e.clientX;
+      d.sy = e.clientY;
+    }
+  };
+
+  const onPointerUp = () => {
+    dragRef.current = null;
+  };
+
+  const cls = [
+    'dag-node',
+    'dag-node--task',
+    `status-${node.status}`,
+    collapsed ? 'is-collapsed' : 'is-expanded',
+    isAnchor ? 'is-anchor' : '',
+    sourceSelected ? 'is-source-selected' : '',
+    zoomed ? 'is-zoomed' : '',
+    dim ? 'dimmed' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const prog = node.progress;
+  const pct =
+    prog && prog.expectedMs > 0
+      ? Math.min(100, Math.round((prog.elapsedMs / prog.expectedMs) * 100))
+      : 0;
+
+  // 可删除：无下游依赖即可删（有下游暂不允许）
+  const canDelete = childrenCount === 0;
+
+  const confirmDelete = () => {
+    if (window.confirm(`确定删除卡片「${node.title}」吗？`)) {
+      // 先执行删除，再关闭菜单，保证 store 状态一致
+      useGraphStore.getState().removeNode(node.nodeId);
+      closeMenu();
+    } else {
+      closeMenu();
+    }
+  };
+
+  return (
+    <div
+      ref={cardRef}
+      className={cls}
+      style={{ left: x, top: y, width, height, '--zoom-comp': zoomComp ?? 0.5 } as React.CSSProperties}
+      onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
+      onContextMenu={handleContextMenu}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+    >
+      {menu ? (
+        <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()}>
+          <button
+            className="ctx-item"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              useGraphStore.getState().clickNode(node.nodeId);
+              closeMenu();
+            }}
+          >
+            设为锚点
+          </button>
+          {['running', 'ready', 'pending'].includes(node.status) ? (
+            <button
+              className="ctx-item"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                useGraphStore.getState().cancelNode(node.nodeId);
+                closeMenu();
+              }}
+            >
+              取消执行
+            </button>
+          ) : null}
+          {['failed', 'cancelled'].includes(node.status) ? (
+            <button
+              className="ctx-item"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                useGraphStore.getState().retryNode(node.nodeId);
+                closeMenu();
+              }}
+            >
+              重试
+            </button>
+          ) : null}
+          <button
+            className="ctx-item"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              useGraphStore.getState().toggleCollapsed(node.nodeId);
+              closeMenu();
+            }}
+          >
+            {collapsed ? '展开' : '收起'}
+          </button>
+          <div className="ctx-sep" />
+          <div className="ctx-group-label">新建卡片</div>
+          <button
+            className="ctx-item"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              useGraphStore.getState().quickCreate(node.nodeId, 'serial');
+              closeMenu();
+            }}
+          >
+            ＋ 串行（下游）
+          </button>
+          <button
+            className="ctx-item"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              useGraphStore.getState().quickCreate(node.nodeId, 'parallel');
+              closeMenu();
+            }}
+          >
+            ＋ 并行（同层）
+          </button>
+          <button
+            className="ctx-item"
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              useGraphStore.getState().quickCreate(node.nodeId, 'join');
+              closeMenu();
+            }}
+          >
+            ＋ 合并（join）
+          </button>
+          {canDelete ? (
+            <button
+              className="ctx-item ctx-item-danger"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                confirmDelete();
+              }}
+            >
+              删除卡片
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="card-head">
+        <span className="status-dot" />
+        {editingTitle ? (
+          <input
+            className="title-edit-input"
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitTitle();
+              if (e.key === 'Escape') setEditingTitle(false);
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          />
+        ) : (
+          <div className="card-title" title={`${node.title}（点 ✎ 编辑标题）`}>
+            {node.title}
+          </div>
+        )}
+        <div className="card-head-actions">
+          <span className="status-badge">{meta.label}</span>
+          {sourceSelected ? <span className="source-badge">✓ 已选</span> : null}
+          <button
+            className="icon-btn"
+            title="编辑标题"
+            onClick={(e) => {
+              e.stopPropagation();
+              setTitleDraft(node.title);
+              setEditingTitle(true);
+            }}
+          >
+            ✎
+          </button>
+          <button
+            className="icon-btn"
+            title={collapsed ? '展开' : '收起'}
+            onClick={(e) => {
+              e.stopPropagation();
+              useGraphStore.getState().toggleCollapsed(node.nodeId);
+            }}
+          >
+            {collapsed ? '▾' : '▴'}
+          </button>
+          <button
+            className="icon-btn anchor-btn"
+            title="设为锚点"
+            onClick={(e) => {
+              e.stopPropagation();
+              useGraphStore.getState().clickNode(node.nodeId);
+            }}
+          >
+            ⌖
+          </button>
+          {canDelete ? (
+            <button
+              className="icon-btn delete-btn"
+              title="删除卡片"
+              onClick={(e) => {
+                e.stopPropagation();
+                confirmDelete();
+              }}
+            >
+              ✕
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {collapsed ? (
+        <div className="card-body-collapsed">
+          <div className="card-summary">
+            {node.output?.summary ??
+              (node.status === 'pending'
+                ? '等待上游节点完成…'
+                : node.status === 'ready'
+                  ? '就绪，等待调度…'
+                  : node.status === 'running'
+                    ? '执行中…'
+                    : node.status === 'paused'
+                      ? '已暂停，等待恢复'
+                      : node.status === 'blocked'
+                        ? '等待用户裁决（跳过失败 / 取消）'
+                        : node.status === 'done'
+                          ? '已完成，双击查看详情'
+                          : node.meta.failedReason ?? '')}
+          </div>
+          {(node.status === 'running' || node.status === 'paused') && prog ? (
+            <>
+              <div className="card-progress">
+                <div className="card-progress-inner" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="card-meta-line">
+                <span>{prog.tokens} tok</span>
+                <span>{Math.round(prog.elapsedMs / 1000)}s</span>
+              </div>
+            </>
+          ) : null}
+          <div className="card-meta">
+            {node.meta.mode ? <span className="mode-chip">{MODE_LABEL[node.meta.mode]}</span> : null}
+            {node.subtreeCollapsed ? <span className="mode-chip fold-chip">子树已折叠</span> : null}
+            <span>{childrenCount} 个子任务</span>
+            {prog?.elapsedMs != null && node.status !== 'running' && node.status !== 'paused' ? (
+              <span>{Math.round(prog.elapsedMs / 1000)}s</span>
+            ) : null}
+          </div>
+          <QuickCreateButtons nodeId={node.nodeId} />
+        </div>
+      ) : (
+        <div className="card-body-expanded">
+          <ParentContextCard parentContext={node.parentContext ?? []} />
+          <ExecutionCard plan={node.plan} messages={node.messages ?? []} />
+          <div className="chat-flow" ref={chatRef}>
+            {(node.messages ?? []).map((m) => {
+              if (m.role === 'system') {
+                return null; // 系统步骤统一由 ExecutionCard 汇总展示
+              }
+              return (
+                <div key={m.id} className={`chat-msg chat-${m.role}`}>
+                  <div className="chat-bubble-wrap">
+                    <div className="chat-bubble">
+                      {m.text}
+                      {m.streaming ? <span className="chat-cursor">▍</span> : null}
+                    </div>
+                    <button
+                      className="copy-btn"
+                      title="复制"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (m.text) navigator.clipboard?.writeText(m.text);
+                      }}
+                    >
+                      ⧉
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+            {(node.messages ?? []).length === 0 ? (
+              <div className="chat-empty">在这个卡片里开始对话吧，可连续多轮追问。</div>
+            ) : null}
+          </div>
+
+          {node.status === 'failed' && node.meta.failedReason ? (
+            <div className="fail-reason">{node.meta.failedReason}</div>
+          ) : null}
+
+          <div className="chat-input-box">
+            <div className="chat-input-top">
+              <textarea
+                ref={inputRef}
+                className="chat-input"
+                value={draft}
+                onChange={(e) => {
+                  setDraft(e.target.value);
+                  // DeepSeek 风格：内容多时自适应长高，上限约 140px
+                  const el = e.target;
+                  el.style.height = 'auto';
+                  el.style.height = `${Math.min(140, el.scrollHeight)}px`;
+                }}
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendChat();
+                  }
+                }}
+                placeholder={node.status === 'running' ? '正在回复…' : '输入新一轮问题（Enter 发送）'}
+                rows={3}
+              />
+              {node.status === 'running' || node.status === 'paused' ? (
+                <button
+                  className="btn btn-warn chat-send-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useGraphStore.getState().cancelNode(node.nodeId);
+                  }}
+                >
+                  停止
+                </button>
+              ) : (
+                <button
+                  className="btn btn-primary chat-send-btn"
+                  disabled={!draft.trim()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    sendChat();
+                  }}
+                >
+                  发送
+                </button>
+              )}
+            </div>
+            <div className="chat-input-toolbar">
+              <label className="upload-btn" title="上传文件到工作区">
+                ＋
+                <input
+                  type="file"
+                  hidden
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) useGraphStore.getState().uploadNodeFile(node.nodeId, f);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              <select
+                className="model-select"
+                value={node.model || ''}
+                onChange={(e) => useGraphStore.getState().setNodeModel(node.nodeId, e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                title="选择模型"
+              >
+                <option value="">默认</option>
+                {useGraphStore.getState().availableModels.map((m) => (
+                  <option key={`${m.provider}-${m.model}`} value={m.model}>
+                    {m.label} · {m.model}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="card-actions">
+            {node.status === 'blocked' ? (
+              <>
+                <button
+                  className="btn btn-warn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useGraphStore.getState().resolveBlocked(node.nodeId, 'skip');
+                  }}
+                >
+                  跳过失败继续
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useGraphStore.getState().resolveBlocked(node.nodeId, 'cancel');
+                  }}
+                >
+                  整体取消
+                </button>
+              </>
+            ) : null}
+            {['running', 'ready', 'pending'].includes(node.status) ? (
+              <button
+                className="btn btn-ghost"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useGraphStore.getState().cancelNode(node.nodeId);
+                }}
+              >
+                取消
+              </button>
+            ) : null}
+            {node.status === 'running' ? (
+              <button
+                className="btn btn-ghost"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useGraphStore.getState().pauseNode(node.nodeId);
+                }}
+              >
+                暂停
+              </button>
+            ) : null}
+            {node.status === 'paused' ? (
+              <button
+                className="btn btn-ghost"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useGraphStore.getState().resumeNode(node.nodeId);
+                }}
+              >
+                恢复
+              </button>
+            ) : null}
+            {['failed', 'cancelled'].includes(node.status) ? (
+              <button
+                className="btn btn-ghost"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useGraphStore.getState().retryNode(node.nodeId);
+                }}
+              >
+                重试
+              </button>
+            ) : null}
+            {childrenCount > 0 ? (
+              <button
+                className="btn btn-ghost"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  useGraphStore.getState().toggleSubtree(node.nodeId);
+                }}
+              >
+                {node.subtreeCollapsed ? '展开子树' : '折叠子树'}
+              </button>
+            ) : null}
+          </div>
+          <QuickCreateButtons nodeId={node.nodeId} compact />
+          {!inWindow ? (
+            <div
+              className="resize-handle"
+              title="拖动调整卡片大小"
+              onPointerDown={onResizePointerDown}
+            >
+              ◢
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+import type { ChatMessage } from '../types';
+
+function ExecutionCard({ plan, messages }: { plan?: { goal?: string; steps?: { label: string; status: string }[] }; messages: ChatMessage[] }) {
+  const planSteps = plan?.steps ?? [];
+  const execSteps = messages.filter((m) => m.role === 'system');
+  if (planSteps.length === 0 && execSteps.length === 0) return null;
+  const [expanded, setExpanded] = useState(false);
+  const goal = plan?.goal || '任务执行';
+  return (
+    <div className="exec-card">
+      <button className="exec-head" onClick={() => setExpanded(!expanded)}>
+        <span className="exec-icon">🧭</span>
+        <span className="exec-goal">{goal}</span>
+        <span className="exec-chevron">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded ? (
+        <div
+          className="exec-body"
+          onWheel={(e) => {
+            // 鼠标停在该区域时滚轮滚动本区域，不冒泡到卡片/画布
+            const el = e.currentTarget;
+            if (el.scrollHeight > el.clientHeight) {
+              e.stopPropagation();
+              el.scrollTop += e.deltaY;
+            }
+          }}
+        >
+          {planSteps.map((s, i) => (
+            <div key={`p-${i}`} className={`exec-item exec-plan-${s.status}`}>
+              <span className="exec-item-icon">{statusPlanIcon(s.status)}</span>
+              <span className="exec-item-label">{s.label}</span>
+            </div>
+          ))}
+          {planSteps.length > 0 && execSteps.length > 0 ? <div className="exec-divider" /> : null}
+          {execSteps.map((s: any) => {
+            const st = stepStatus(s.step || '');
+            return (
+              <div key={s.id} className="exec-item">
+                <span className={`exec-item-icon exec-step-${st}`}>{statusIcon(st)}</span>
+                <span className="exec-item-label">{s.step}</span>
+                {s.detail ? <span className="exec-item-detail">{s.detail}</span> : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function statusPlanIcon(s: string): string {
+  return s === 'done' ? '✓' : s === 'running' ? '⏳' : s === 'failed' ? '✗' : '○';
+}
+
+function ParentContextCard({ parentContext }: { parentContext: { parentNodeId: string; parentTitle: string; seq?: number; summary: string }[] }) {
+  if (!parentContext || parentContext.length === 0) return null;
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="parent-context-card">
+      <button className="parent-context-head" onClick={() => setExpanded(!expanded)}>
+        <span className="parent-context-label">上游上下文</span>
+        <span className="parent-context-count">{parentContext.length} 块</span>
+        <span className="parent-context-chevron">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded ? (
+        <div className="parent-context-body">
+          {parentContext.map((b, i) => (
+            <div key={`${b.parentNodeId}-${b.seq ?? i}`} className="parent-context-item">
+              <span className="parent-context-title">{b.parentTitle}{b.seq ? ` #${b.seq}` : ''}</span>
+              <span className="parent-context-summary">{b.summary}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function stepStatus(label: string): 'pending' | 'done' | 'reject' | 'run' {
+  if (label.includes('拒绝') || label.includes('失败')) return 'reject';
+  if (label.includes('待审批')) return 'pending';
+  if (label.includes('执行') || label.includes('调用')) return 'run';
+  return 'done';
+}
+
+function statusIcon(s: string): string {
+  return s === 'reject' ? '✗' : s === 'pending' ? '⏳' : s === 'run' ? '⚙' : '✓';
+}
+
+function QuickCreateButtons({ nodeId, compact }: { nodeId: string; compact?: boolean }) {
+  return (
+    <div className={`card-append-quick${compact ? ' is-compact' : ''}`}>
+      <button
+        className="quick-btn"
+        title="创建串行子卡片（引用本卡片内容）"
+        onClick={(e) => {
+          e.stopPropagation();
+          useGraphStore.getState().quickCreate(nodeId, 'serial');
+        }}
+      >
+        ＋ 串行
+      </button>
+      <button
+        className="quick-btn"
+        title="创建并行兄弟卡片"
+        onClick={(e) => {
+          e.stopPropagation();
+          useGraphStore.getState().quickCreate(nodeId, 'parallel');
+        }}
+      >
+        ＋ 并行
+      </button>
+      <button
+        className="quick-btn"
+        title="合并本卡片与其它卡片（进入选源）"
+        onClick={(e) => {
+          e.stopPropagation();
+          useGraphStore.getState().quickCreate(nodeId, 'join');
+        }}
+      >
+        ＋ 合并
+      </button>
+    </div>
+  );
+}
+

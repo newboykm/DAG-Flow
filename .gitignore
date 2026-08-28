@@ -1,0 +1,13 @@
+node_modules
+dist
+*.local
+.DS_Store
+npm-debug.log*
+
+# 运行时数据(不提交)
+models/
+backend/chroma_store/
+backend/dags.db
+.reasonix/
+__pycache__/
+*.pyc
