@@ -1,13 +1,36 @@
-node_modules
-dist
-*.local
-.DS_Store
-npm-debug.log*
+# ---------- 依赖 / 构建 ----------
+node_modules/
+dist/
+*.log
 
-# 运行时数据(不提交)
-models/
-backend/chroma_store/
+# ---------- 运行数据 / 密钥（⚠️ 严禁提交） ----------
 backend/dags.db
-.reasonix/
+backend/dags.db-journal
+backend/dags.db-wal
+backend/dags.db-shm
+backend/chroma_store/
+#
+# 含 secret.key（API Key 解密钥匙）与用户记忆全文，切勿提交
+.agents/
+*.db
+*.sqlite
+*.sqlite3
+
+# ---------- 本地模型（体积大，可选，勿入仓库） ----------
+models/
+
+# ---------- Python ----------
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---------- 环境 / 编辑器 ----------
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
