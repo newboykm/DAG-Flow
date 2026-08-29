@@ -68,6 +68,11 @@
 - 存放路径：`models/bge-small-zh-v1.5/`（已下载到项目内，无需联网）
 - 未安装 sentence-transformers 时，自动降级为「离线哈希 embedding」（零依赖、可用但语义弱）
 
+### Reranker 精排模型（可选）
+- 模型：`BAAI/bge-reranker-base`（交叉编码器，RAG 双阶段中的精排阶段）
+- 存放路径：`models/bge-reranker-base/`（约 1.1GB，`setup.ps1 -WithReranker` 下载）
+- 行为：检索时先按 embedding 召回更多候选，再用 reranker 重排取 top-k；模型缺失/加载失败自动降级为 embedding 顺序（不阻塞）
+
 ## 五、外部服务（可选）
 
 | 服务 | 用途 | 配置位置 |
@@ -85,6 +90,7 @@
 | 长期记忆（remember/memory/forget） | `.agents/memories/` |
 | 内置 skill 定义 | `backend/skills/` |
 | 本地 embedding 模型 | `models/bge-small-zh-v1.5/` |
+| Reranker 精排模型（可选） | `models/bge-reranker-base/` |
 
 ## 七、一键安装脚本
 

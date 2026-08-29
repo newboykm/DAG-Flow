@@ -82,6 +82,17 @@ def _approval_id() -> str:
     return "ap-" + uuid.uuid4().hex[:12]
 
 
+def _brief_args(args: dict) -> str:
+    """把工具参数压缩成一行便于展示（"每步具体在干嘛"）。"""
+    parts = []
+    for k, v in (args or {}).items():
+        sv = str(v).replace("\n", " ")
+        if len(sv) > 60:
+            sv = sv[:60] + "…"
+        parts.append(f"{k}={sv}")
+    return " ".join(parts)
+
+
 def _now_dt():
     from datetime import datetime
     return datetime.now()
@@ -93,31 +104,25 @@ def _gen_step_id() -> str:
 
 
 def _summary_from_json(s: str) -> str:
-    """从 LLM 返回的结构化摘要 JSON 里提取纯文本摘要。"""
-    import json as _json
-    import re as _re
+    """从 LLM 返回的结构化摘要 JSON 里提取纯文本摘要（统一走 jsonutil 严格解析）。"""
     if not s or not s.strip():
         return ""
-    s = s.strip()
-    # 去掉可能的代码块围栏
-    s = _re.sub(r"^```(?:json)?\s*", "", s)
-    s = _re.sub(r"\s*```$", "", s)
     try:
-        obj = _json.loads(s)
-        if isinstance(obj, dict):
-            summary = obj.get("summary")
-            if not summary:
-                # 用 key_points + conclusion 拼出摘要
-                parts = []
-                if obj.get("key_points"):
-                    parts.append("；".join(obj["key_points"]) if isinstance(obj["key_points"], list) else str(obj["key_points"]))
-                if obj.get("conclusion"):
-                    parts.append(f"结论：{obj['conclusion']}")
-                summary = "。".join(parts)
-            return (summary or "").strip()
+        from .jsonutil import parse_json_object, expect_str, expect_list
+        obj = parse_json_object(s)
+        summary = expect_str(obj, "summary", "")
+        if not summary:
+            parts = []
+            kps = expect_list(obj, "key_points", [])
+            if kps:
+                parts.append("；".join(str(k) for k in kps))
+            conc = expect_str(obj, "conclusion", "")
+            if conc:
+                parts.append(f"结论：{conc}")
+            summary = "。".join(parts)
+        return (summary or "").strip()
     except Exception:
-        pass
-    return s[:500]
+        return s[:500]
 
 
 async def _rolling_memory(provider, model: str, old_memory: dict | None, user_text: str, final_text: str) -> dict | None:
@@ -142,25 +147,74 @@ async def _rolling_memory(provider, model: str, old_memory: dict | None, user_te
     ]
     try:
         from .executor import _chat_once_text
-        content = await _chat_once_text(provider.baseUrl.rstrip("/"), provider.apiKey, model, msgs)
-        content = (content or "").strip()
-        if content.startswith("```"):
-            import re as _re
-            content = _re.sub(r"^```(?:json)?\s*", "", content)
-            content = _re.sub(r"\s*```$", "", content)
-        obj = _json.loads(content)
-        summary = obj.get("summary") or old_summary or final_text[:150]
-        key_facts = obj.get("key_facts") or []
-        if not isinstance(key_facts, list):
-            key_facts = [str(key_facts)]
-        return {"summary": summary, "key_facts": key_facts[:5], "conclusion": obj.get("conclusion") or ""}
+        from .jsonutil import parse_json_object, expect_str, expect_list
+        content = await _chat_once_text(provider.baseUrl.rstrip("/"), provider.pick_api_key(), model, msgs)
+        obj = parse_json_object(content or "")  # 剥围栏 + 严格解析
+        summary = expect_str(obj, "summary", "") or old_summary or final_text[:150]
+        key_facts = [str(f) for f in expect_list(obj, "key_facts", []) if str(f).strip()]
+        conclusion = expect_str(obj, "conclusion", "")
+        return _prune_memory(
+            summary=summary,
+            key_facts=key_facts[:8],
+            conclusion=conclusion,
+            archive=old.get("archive") or [],
+        )
     except Exception:
         # 回退：合并旧摘要与本轮产出简单拼接
-        return {
-            "summary": f"{old_summary}; {final_text[:120]}".strip("; "),
-            "key_facts": old_facts,
-            "conclusion": final_text[:200],
-        }
+        return _prune_memory(
+            summary=f"{old_summary}; {final_text[:120]}".strip("; "),
+            key_facts=old_facts,
+            conclusion=final_text[:200],
+            archive=old.get("archive") or [],
+        )
+
+
+def _prune_memory(
+    summary: str,
+    key_facts: list,
+    conclusion: str,
+    archive: list,
+) -> dict:
+    """memory 剪枝 + 层级摘要压缩（对齐业界「递归/分层记忆」）。
+
+    规则（防止记忆无限膨胀）：
+    1. key_facts 超过上限：把最旧的若干条 roll-up 进 summary，再删除它们（不再无限累积）。
+    2. summary 超过长度上限：把当前 summary 下沉为「更底层 archive 条目」（分层摘要），
+       让 summary 保持是「近期要点」，历史则压缩进 archive（数量也限流）。
+    3. 时间戳：archive 条目带 when 标签，便于区分新旧。
+    """
+    import time as _time
+
+    facts = [str(f) for f in (key_facts or []) if str(f).strip()]
+    MAX_FACTS = 8
+    MAX_SUMMARY_CHARS = 220
+    MAX_ARCHIVE = 12
+
+    arch = list(archive or [])
+    now = _time.strftime("%m-%d %H:%M")
+
+    # 规则1：key_facts 溢出 → 最旧条 roll-up 进 summary
+    if len(facts) > MAX_FACTS:
+        overflow = facts[: len(facts) - MAX_FACTS]
+        facts = facts[-MAX_FACTS:]
+        if overflow:
+            summary = (summary + "；" + "；".join(overflow)).strip("；")[:MAX_SUMMARY_CHARS + 200]
+
+    # 规则2：summary 过长 → 下沉到 archive（分层），重开近期 summary
+    if len(summary) > MAX_SUMMARY_CHARS:
+        if summary:
+            arch.append({"layer": len(arch) + 1, "when": now, "summary": summary.strip()})
+            if len(arch) > MAX_ARCHIVE:
+                # 只保留最近 MAX_ARCHIVE 层（更早的已退化，不再累积）
+                arch = arch[-MAX_ARCHIVE:]
+        summary = (conclusion or "").strip() or summary[:MAX_SUMMARY_CHARS]
+
+    return {
+        "summary": summary[:MAX_SUMMARY_CHARS + 400],
+        "key_facts": facts,
+        "conclusion": conclusion,
+        "archive": arch,
+    }
 
 
 async def _request_approval(db, node: Node, tool: str, args: dict) -> Approval:
@@ -235,7 +289,7 @@ async def publish_output_to_context(db, node: Node) -> None:
         try:
             summary_json = await summarize_text(
                 provider.baseUrl.rstrip("/"),
-                provider.apiKey,
+                provider.pick_api_key(),
                 (node.__dict__.get("model") or None) or ((provider.models or [])[0] if provider.models else "default"),
                 fulltext,
             )
@@ -419,13 +473,31 @@ async def _run_real(node_id: str) -> None:
         cfg_base = provider.baseUrl.rstrip("/")
         provider_model = (node.__dict__.get("model") or None) or ((provider.models or [])[0] if provider.models else "default")
 
+        # 上下文实时压缩：长对话时把更早历史折叠成摘要，避免滚动截断丢信息
+        try:
+            from .executor import compact_history
+            history = await compact_history(
+                cfg_base, provider.pick_api_key(), provider_model, history,
+                keep_recent=6, max_old_chars=6000,
+            )
+        except Exception:
+            pass  # 压缩失败不影响主流程
+
         # 加载 skill 能力清单（内置默认 + 用户自定义目录）
         from .models import AppConfig
         from .skills import load_all_skills_prompt
         skill_row = db.query(AppConfig).filter(AppConfig.key == "skill_dir").first()
         skills_text = load_all_skills_prompt(skill_row.value if skill_row else None)
 
-        messages = build_messages(node.title, user_text, history, parent_outputs, node.memory, skills_text)
+        # 开工主动加载项目上下文（README/约定 + 结构），让 agent 动手前先理解项目
+        project_context = ""
+        try:
+            from .project_scan import get_project_context
+            project_context = get_project_context(workspace)
+        except Exception:
+            project_context = ""
+
+        messages = build_messages(node.title, user_text, history, parent_outputs, node.memory, skills_text, project_context)
         tools = openai_tools()
         # 合并已启用的 MCP server 工具（第三方工具生态）
         mcp_tools_by_name: dict[str, str] = {}  # 工具名 -> server 名
@@ -452,7 +524,7 @@ async def _run_real(node_id: str) -> None:
 
         # 生成执行计划并推送前端（对齐主流 Planning agent）
         node.plan = await generate_plan(
-            cfg_base, provider.apiKey, provider_model,
+            cfg_base, provider.pick_api_key(), provider_model,
             user_text, parent_outputs, node.memory,
         )
         db.commit()
@@ -474,6 +546,9 @@ async def _run_real(node_id: str) -> None:
             node.messages = msgs
             db.commit()
 
+        # 记录本节点已同步到会话 usage 的 token，避免重复累加（用于实时费用/余额）
+        _usage_synced = {"p": 0, "c": 0}
+
         async def flush(text: str, streaming: bool):
             msgs = list(node.messages or [])
             for i in range(len(msgs) - 1, -1, -1):
@@ -481,6 +556,50 @@ async def _run_real(node_id: str) -> None:
                     msgs[i] = {**msgs[i], "text": text, "streaming": streaming}
                     break
             node.messages = msgs
+            # token 实时估算（prompt 按 messages 序列化长度，completion 按已生成字符）
+            try:
+                prompt_chars = sum(len(str(m2.get("content") or m2.get("text") or "")) for m2 in messages)
+                prev = node.progress or {}
+                node.progress = {
+                    **prev,
+                    "promptTokens": max(int(prompt_chars / 3), prev.get("promptTokens") or 0),
+                    "completionTokens": max(int(len(acc) / 3), prev.get("completionTokens") or 0),
+                    "tokens": int((prompt_chars + len(acc)) / 3),
+                    "elapsedMs": int((time.monotonic() - prev.get("startedAt", time.monotonic())) * 1000),
+                }
+                # 把本节点实时 token 同步到会话 usage（增量累计，供实时费用/余额）
+                try:
+                    cur_p = int(node.progress.get("promptTokens") or 0)
+                    cur_c = int(node.progress.get("completionTokens") or 0)
+                    dp = cur_p - _usage_synced["p"]
+                    dc = cur_c - _usage_synced["c"]
+                    if (dp > 0 or dc > 0) and sess:
+                        _usage_synced["p"] = cur_p
+                        _usage_synced["c"] = cur_c
+                        usage = dict(sess.usage or {})
+                        np = usage.get("promptTokens", 0) + dp
+                        nc = usage.get("completionTokens", 0) + dc
+                        usage["promptTokens"] = np
+                        usage["completionTokens"] = nc
+                        from .pricing import compute_cost
+                        usage["cost"] = round(compute_cost(provider_model, np, nc), 6)
+                        sess.usage = usage
+                        sess.updatedAt = _now_dt()
+                        db.commit()
+                        await publish(
+                            node.sessionId,
+                            {
+                                "type": "usage",
+                                "promptTokens": np,
+                                "completionTokens": nc,
+                                "cost": usage["cost"],
+                                "budget": sess.budget,
+                            },
+                        )
+                except Exception:
+                    pass
+            except Exception:
+                pass
             db.commit()
             await publish(
                 node.sessionId,
@@ -531,12 +650,20 @@ async def _run_real(node_id: str) -> None:
 
         async def set_plan_step(idx: int, status: str):
             """标记计划步骤状态并推送。"""
-            plan = node.plan or {}
+            import copy
+            plan = copy.deepcopy(node.plan or {})  # 深拷贝为新对象，确保 SQLAlchemy 检测 JSON 变更并落库
             steps = list(plan.get("steps") or [])
             if 0 <= idx < len(steps):
                 steps[idx] = {**steps[idx], "status": status}
                 plan["steps"] = steps
                 node.plan = plan
+                # 计划完成度：已完成步骤 / 总步骤
+                done = sum(1 for s in steps if s.get("status") == "done")
+                node.progress = {
+                    **(node.progress or {}),
+                    "stepDone": done,
+                    "stepTotal": len(steps),
+                }
                 db.commit()
                 await publish(
                     node.sessionId,
@@ -545,6 +672,7 @@ async def _run_real(node_id: str) -> None:
                         "nodeId": node.nodeId,
                         "status": node.status,
                         "plan": node.plan,
+                        "progress": node.progress,
                         "messages": node.messages,
                     },
                 )
@@ -561,7 +689,7 @@ async def _run_real(node_id: str) -> None:
         acc = ""
         total_prompt = 0
         total_completion = 0
-        max_rounds = 6
+        max_rounds = 25
         fail_counts: dict[str, int] = {}
 
         def is_failure(result: str) -> bool:
@@ -598,7 +726,7 @@ async def _run_real(node_id: str) -> None:
 
             round_text = ""
             tool_calls: list[dict] = []
-            async for ev in stream_chat_with_tools(cfg_base, provider.apiKey, provider_model, messages, tools, temperature=0.2):
+            async for ev in stream_chat_with_tools(cfg_base, provider.pick_api_key(), provider_model, messages, tools, temperature=0.2):
                 if cancelled():
                     break
                 if ev["type"] == "delta":
@@ -665,14 +793,14 @@ async def _run_real(node_id: str) -> None:
                             result = f"用户拒绝了工具 {name} 的调用"
                             await flush_step("已拒绝", name)
                         else:
-                            await flush_step("执行工具", name)
+                            await flush_step("执行工具", f"{name}({_brief_args(parsed)})")
                             try:
                                 result = await execute(name, parsed, workspace, tool_ctx)
                             except Exception as e:  # noqa: BLE001
                                 result = f"工具执行出错：{e}"
                             await flush_step("工具结果", (result or "")[:120])
                     else:
-                        await flush_step("执行工具", name)
+                        await flush_step("执行工具", f"{name}({_brief_args(parsed)})")
                         try:
                             result = await execute(name, parsed, workspace, tool_ctx)
                         except Exception as e:  # noqa: BLE001
@@ -718,7 +846,8 @@ async def _run_real(node_id: str) -> None:
         await flush(final_text, False)
 
         # 计划收尾：把剩余步骤全部标记完成
-        final_plan = node.plan or {}
+        import copy
+        final_plan = copy.deepcopy(node.plan or {})  # 新对象，确保 SQLAlchemy 检测变更并持久化 plan
         steps = list(final_plan.get("steps") or [])
         for i in range(len(steps)):
             if steps[i].get("status") != "done":
@@ -760,7 +889,9 @@ async def _run_real(node_id: str) -> None:
                 "nodeId": node.nodeId,
                 "status": "done",
                 "progress": node.progress,
+                "plan": node.plan,
                 "messages": node.messages,
+                "output": node.output,
             },
         )
     except Exception as e:  # noqa: BLE001
@@ -800,7 +931,7 @@ async def _run_subagent(
     acc = ""
     for _ in range(max(1, min(max_rounds, 6))):
         tool_calls: list[dict] = []
-        async for ev in stream_chat_with_tools(provider.baseUrl.rstrip("/"), provider.apiKey, model, messages, tools, temperature=0.2):
+        async for ev in stream_chat_with_tools(provider.baseUrl.rstrip("/"), provider.pick_api_key(), model, messages, tools, temperature=0.2):
             if ev["type"] == "delta":
                 acc += ev["text"]
             elif ev["type"] == "done":

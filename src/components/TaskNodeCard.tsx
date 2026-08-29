@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useGraphStore } from '../store/useGraphStore';
 import { STATUS_META } from '../graph/statusMeta';
 import { api } from '../api';
@@ -55,6 +56,34 @@ export default function TaskNodeCard(props: Props) {
     }
   };
 
+  // 多模态：把图片 OCR 成文本，追加到输入框（模型是文本模型，通过 OCR 看图片文字）
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const handleOcr = async (file: File | Blob, filename?: string) => {
+    if (ocrBusy) return;
+    setOcrBusy(true);
+    try {
+      const { text } = await api.ocr(file, filename);
+      const piece = text.trim()
+        ? `【图片内容】\n${text.trim()}`
+        : '【图片内容】(未能识别出文字)';
+      setDraft((prev) => (prev ? prev + '\n' + piece : piece));
+    } catch {
+      alert('图片识别（OCR）失败，请重试');
+    } finally {
+      setOcrBusy(false);
+    }
+  };
+
+  // 粘贴图片：拦截并 OCR
+  const onChatPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData?.files ?? []);
+    const img = files.find((f) => f.type.startsWith('image/'));
+    if (img) {
+      e.preventDefault();
+      handleOcr(img, img.name || 'pasted.png');
+    }
+  };
+
   // 展开态右下角手柄：拖动调整宽高（按下拖动、松开停止）
   const onResizePointerDown = (e: React.PointerEvent) => {
     e.stopPropagation();
@@ -100,6 +129,13 @@ export default function TaskNodeCard(props: Props) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      // 鼠标落在内置滚动区（执行过程 / 任务栏）时，滚动它自身，不滚聊天区
+      const t = e.target as HTMLElement | null;
+      const scroller = t && t.closest ? t.closest('.exec-fold-body, .exec-body') : null;
+      if (scroller) {
+        scroller.scrollTop += e.deltaY;
+        return;
+      }
       const chat = chatRef.current;
       if (chat) chat.scrollTop += e.deltaY;
     };
@@ -122,13 +158,8 @@ export default function TaskNodeCard(props: Props) {
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    // 相对卡片定位（避免 Portal/fixed 在 transform 缩放容器下的坐标错乱）
-    const rect = cardRef.current?.getBoundingClientRect();
-    if (rect) {
-      setMenu({ x: e.clientX - rect.left, y: e.clientY - rect.top });
-    } else {
-      setMenu({ x: 0, y: 0 });
-    }
+    // 用视口坐标 + Portal 渲染到 body，避免被卡片/画布裁剪，也不受 transform 缩放影响
+    setMenu({ x: e.clientX, y: e.clientY });
   };
 
   // 单击=设锚点（延迟以区分双击）；双击=展开/收起（§5.2 交互决议）
@@ -204,10 +235,28 @@ export default function TaskNodeCard(props: Props) {
     .join(' ');
 
   const prog = node.progress;
+  const fmtTok = (n?: number) => {
+    const v = n || 0;
+    return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : `${v}`;
+  };
+  const fmtDur = (ms?: number) => {
+    const s = Math.max(0, Math.floor((ms || 0) / 1000));
+    if (s < 60) return `${s}s`;
+    const mm = Math.floor(s / 60);
+    const ss = s % 60;
+    return `${mm}m${ss}s`;
+  };
+  // 进度：优先用计划完成度（已完成步骤/总步骤），否则退回按耗时估算
+  const stepTotal = prog?.stepTotal ?? 0;
+  const stepDone = prog?.stepDone ?? 0;
+  const stepPct =
+    stepTotal > 0 ? Math.min(100, Math.round((stepDone / stepTotal) * 100)) : -1;
   const pct =
-    prog && prog.expectedMs > 0
-      ? Math.min(100, Math.round((prog.elapsedMs / prog.expectedMs) * 100))
-      : 0;
+    stepPct >= 0
+      ? stepPct
+      : prog && prog.expectedMs > 0
+        ? Math.min(100, Math.round((prog.elapsedMs / prog.expectedMs) * 100))
+        : 0;
 
   // 可删除：无下游依赖即可删（有下游暂不允许）
   const canDelete = childrenCount === 0;
@@ -235,8 +284,9 @@ export default function TaskNodeCard(props: Props) {
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {menu ? (
-        <div className="ctx-menu" style={{ left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()}>
+      {menu
+        ? createPortal(
+            <div className="ctx-menu" style={{ position: 'fixed', left: menu.x, top: menu.y }} onClick={(e) => e.stopPropagation()}>
           <button
             className="ctx-item"
             onMouseDown={(e) => {
@@ -332,8 +382,10 @@ export default function TaskNodeCard(props: Props) {
               删除卡片
             </button>
           ) : null}
-        </div>
-      ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
       <div className="card-head">
         <span className="status-dot" />
         {editingTitle ? (
@@ -428,8 +480,13 @@ export default function TaskNodeCard(props: Props) {
                 <div className="card-progress-inner" style={{ width: `${pct}%` }} />
               </div>
               <div className="card-meta-line">
-                <span>{prog.tokens} tok</span>
-                <span>{Math.round(prog.elapsedMs / 1000)}s</span>
+                {stepTotal > 0 ? (
+                  <span className="step-indicator">第 {Math.min(stepDone + 1, stepTotal)}/{stepTotal} 步 · {pct}%</span>
+                ) : (
+                  <span>{pct}%</span>
+                )}
+                <span>{fmtTok(prog?.tokens)} tok</span>
+                <span>{fmtDur(prog?.elapsedMs)}</span>
               </div>
             </>
           ) : null}
@@ -438,7 +495,7 @@ export default function TaskNodeCard(props: Props) {
             {node.subtreeCollapsed ? <span className="mode-chip fold-chip">子树已折叠</span> : null}
             <span>{childrenCount} 个子任务</span>
             {prog?.elapsedMs != null && node.status !== 'running' && node.status !== 'paused' ? (
-              <span>{Math.round(prog.elapsedMs / 1000)}s</span>
+              <span>{fmtDur(prog?.elapsedMs)}</span>
             ) : null}
           </div>
           <QuickCreateButtons nodeId={node.nodeId} />
@@ -446,36 +503,71 @@ export default function TaskNodeCard(props: Props) {
       ) : (
         <div className="card-body-expanded">
           <ParentContextCard parentContext={node.parentContext ?? []} />
-          <ExecutionCard plan={node.plan} messages={node.messages ?? []} />
+          <ExecutionCard plan={node.plan} running={node.status === 'running'} />
           <div className="chat-flow" ref={chatRef}>
-            {(node.messages ?? []).map((m) => {
-              if (m.role === 'system') {
-                return null; // 系统步骤统一由 ExecutionCard 汇总展示
+            {(() => {
+              // 把消息按「每条 user/assistant 回复 + 它下面的执行步骤」分组
+              const groups: { msg: any; steps: any[] }[] = [];
+              for (const m of node.messages ?? []) {
+                if (m.role === 'system') {
+                  if (groups.length) groups[groups.length - 1].steps.push(m);
+                } else {
+                  groups.push({ msg: m, steps: [] });
+                }
+              }
+              if (groups.length === 0) {
+                return <div className="chat-empty">在这个卡片里开始对话吧，可连续多轮追问。</div>;
               }
               return (
-                <div key={m.id} className={`chat-msg chat-${m.role}`}>
-                  <div className="chat-bubble-wrap">
-                    <div className="chat-bubble">
-                      {m.text}
-                      {m.streaming ? <span className="chat-cursor">▍</span> : null}
+                <>
+                  {groups.map((g) => (
+                    <div key={g.msg.id} className="chat-group">
+                      {/* 上面：这一轮的执行过程折叠块（实时展开 / 完成后收起） */}
+                      {g.steps.length > 0 ? (
+                        <details className="exec-fold">
+                          <summary className="exec-fold-head">
+                            <span className="exec-fold-icon">🧭</span>
+                            <span>执行过程（{g.steps.length} 步）</span>
+                            <span className="exec-fold-chevron" />
+                          </summary>
+                          <div className="exec-fold-body">
+                            {g.steps.map((s: any) => {
+                              const st = stepStatus(s.step || '');
+                              return (
+                                <div key={s.id} className={`agent-step agent-step-${st}`}>
+                                  <span className={`input-icon exec-step-${st}`}>{statusIcon(st)}</span>
+                                  <span className="agent-step-label">{s.step || '执行'}</span>
+                                  {s.detail ? <span className="agent-step-detail">{s.detail}</span> : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </details>
+                      ) : null}
+                      {/* 下面：这一轮的消息回复 */}
+                      <div className={`chat-msg chat-${g.msg.role}`}>
+                        <div className="chat-bubble-wrap">
+                          <div className="chat-bubble">
+                            {g.msg.text}
+                            {g.msg.streaming ? <span className="chat-cursor">▍</span> : null}
+                          </div>
+                          <button
+                            className="copy-btn"
+                            title="复制"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (g.msg.text) navigator.clipboard?.writeText(g.msg.text);
+                            }}
+                          >
+                            ⧉
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                    <button
-                      className="copy-btn"
-                      title="复制"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (m.text) navigator.clipboard?.writeText(m.text);
-                      }}
-                    >
-                      ⧉
-                    </button>
-                  </div>
-                </div>
+                  ))}
+                </>
               );
-            })}
-            {(node.messages ?? []).length === 0 ? (
-              <div className="chat-empty">在这个卡片里开始对话吧，可连续多轮追问。</div>
-            ) : null}
+            })()}
           </div>
 
           {node.status === 'failed' && node.meta.failedReason ? (
@@ -497,6 +589,7 @@ export default function TaskNodeCard(props: Props) {
                 }}
                 onClick={(e) => e.stopPropagation()}
                 onPointerDown={(e) => e.stopPropagation()}
+                onPaste={onChatPaste}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault();
@@ -542,6 +635,19 @@ export default function TaskNodeCard(props: Props) {
                   }}
                 />
               </label>
+              <label className="upload-btn" title="图片：上传并识别图中文字（OCR）" style={{ cursor: ocrBusy ? 'wait' : 'pointer' }}>
+                {ocrBusy ? '…' : '🖼'}
+                <input
+                  type="file"
+                  accept="image/*"
+                  hidden
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleOcr(f, f.name);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
               <select
                 className="model-select"
                 value={node.model || ''}
@@ -553,7 +659,7 @@ export default function TaskNodeCard(props: Props) {
                 <option value="">默认</option>
                 {useGraphStore.getState().availableModels.map((m) => (
                   <option key={`${m.provider}-${m.model}`} value={m.model}>
-                    {m.label} · {m.model}
+                    {m.model}
                   </option>
                 ))}
               </select>
@@ -655,50 +761,38 @@ export default function TaskNodeCard(props: Props) {
   );
 }
 
-import type { ChatMessage } from '../types';
-
-function ExecutionCard({ plan, messages }: { plan?: { goal?: string; steps?: { label: string; status: string }[] }; messages: ChatMessage[] }) {
+function ExecutionCard({ plan, running }: { plan?: { goal?: string; steps?: { label: string; status: string }[] }; running?: boolean }) {
   const planSteps = plan?.steps ?? [];
-  const execSteps = messages.filter((m) => m.role === 'system');
-  if (planSteps.length === 0 && execSteps.length === 0) return null;
+  if (planSteps.length === 0) return null;
   const [expanded, setExpanded] = useState(false);
+  // 运行时自动展开，让计划步骤状态实时可见；结束后保持展开（可手动收起）
+  useEffect(() => {
+    if (running) setExpanded(true);
+  }, [running]);
+  const doneCount = planSteps.filter((s) => s.status === 'done').length;
   const goal = plan?.goal || '任务执行';
   return (
     <div className="exec-card">
-      <button className="exec-head" onClick={() => setExpanded(!expanded)}>
+      <button
+        className="exec-head"
+        onClick={(e) => {
+          e.stopPropagation();
+          setExpanded(!expanded);
+        }}
+      >
         <span className="exec-icon">🧭</span>
         <span className="exec-goal">{goal}</span>
+        <span className="exec-step-count">第 {Math.min(doneCount + 1, planSteps.length)}/{planSteps.length} 步 · {Math.round((doneCount / planSteps.length) * 100)}%</span>
         <span className="exec-chevron">{expanded ? '▴' : '▾'}</span>
       </button>
       {expanded ? (
-        <div
-          className="exec-body"
-          onWheel={(e) => {
-            // 鼠标停在该区域时滚轮滚动本区域，不冒泡到卡片/画布
-            const el = e.currentTarget;
-            if (el.scrollHeight > el.clientHeight) {
-              e.stopPropagation();
-              el.scrollTop += e.deltaY;
-            }
-          }}
-        >
+        <div className="exec-body">
           {planSteps.map((s, i) => (
             <div key={`p-${i}`} className={`exec-item exec-plan-${s.status}`}>
               <span className="exec-item-icon">{statusPlanIcon(s.status)}</span>
               <span className="exec-item-label">{s.label}</span>
             </div>
           ))}
-          {planSteps.length > 0 && execSteps.length > 0 ? <div className="exec-divider" /> : null}
-          {execSteps.map((s: any) => {
-            const st = stepStatus(s.step || '');
-            return (
-              <div key={s.id} className="exec-item">
-                <span className={`exec-item-icon exec-step-${st}`}>{statusIcon(st)}</span>
-                <span className="exec-item-label">{s.step}</span>
-                {s.detail ? <span className="exec-item-detail">{s.detail}</span> : null}
-              </div>
-            );
-          })}
         </div>
       ) : null}
     </div>

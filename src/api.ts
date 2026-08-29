@@ -159,6 +159,16 @@ export const api = {
     });
   },
 
+  // 图片 OCR：上传图片，返回识别文本（多模态：图片 → 文本 → 模型）
+  ocr: (file: File | Blob, filename = 'image.png') => {
+    const fd = new FormData();
+    fd.append('file', file, filename);
+    return fetch('/api/ocr', { method: 'POST', body: fd }).then((r) => {
+      if (!r.ok) throw new Error(`OCR 失败 ${r.status}`);
+      return r.json() as Promise<{ text: string }>;
+    });
+  },
+
   getSessionUsage: (sid: string) =>
     request<{ sessionId: string; promptTokens: number; completionTokens: number; cost: number; budget: number | null; balance: number | null }>(`/api/sessions/${sid}/usage`),
 

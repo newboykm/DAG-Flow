@@ -158,7 +158,50 @@ async def execute(name: str, args: dict, workspace: str, ctx: dict | None = None
             err = (proc.stderr or "")[:1000]
             return (f"exit={proc.returncode}\nSTDOUT:\n{out}\nSTDERR:\n{err}").strip() or "exit=0"
         except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            print("[exec_command] failed:", repr(e), flush=True)
+            _tb.print_exc()
             return f"执行失败：{e}"
+
+    if name == "run_python":
+        code = args.get("code", "")
+        if not code.strip():
+            return "代码为空"
+        import asyncio
+        import sys as _sys
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _sys.executable, "-c", code,
+                cwd=_resolve(workspace, "."),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            return (
+                f"exit={proc.returncode}\nSTDOUT:\n{(stdout.decode(errors='replace') or '')[:2000]}"
+                f"\nSTDERR:\n{(stderr.decode(errors='replace') or '')[:1000]}"
+            ).strip() or "exit=0"
+        except Exception as e:  # noqa: BLE001
+            return f"执行失败：{e}"
+
+    if name == "read_image":
+        p = _resolve(workspace, args.get("path", ""))
+        if not os.path.exists(p):
+            return f"文件不存在：{args.get('path')}"
+        import mimetypes
+        size = os.path.getsize(p)
+        mime, _ = mimetypes.guess_type(p)
+        if os.path.isdir(p):
+            return f"这是目录，非文件：{args.get('path')}"
+        # 尽量读出可读文本概要；二进制返回元信息
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                head = f.read(800)
+            if any(not ch.isprintable() and ch not in "\r\n\t" for ch in head[:200]):
+                return f"{os.path.basename(p)}：二进制/图片文件，大小 {size} B，MIME {mime or '未知'}（本实现不提供视觉识别）"
+            return f"{os.path.basename(p)}：大小 {size} B，MIME {mime or 'text/plain'}。内容概览：\n{head[:600]}"
+        except Exception as e:  # noqa: BLE001
+            return f"读取失败：{e}"
 
     if name == "search_files":
         pattern = args.get("pattern", "*")
@@ -207,10 +250,21 @@ def _clip_text(text: str, limit: int = 6000, hint: str = "…（内容过长已�
 
 
 async def _run_command(cmd: str, workspace: str):
-    """异步执行命令（Windows 下通过 cmd /c；其它 shell -c）。"""
+    """异步执行命令。Windows 下：若命令为类 Unix 风格且本机有 Git-bash 的 sh，则用 sh -c（支持 wc/tail/ls/grep 等）；否则用 cmd /c。"""
     import asyncio
+    import shutil
     if os.name == "nt":
-        shell = ["cmd", "/c", cmd]
+        unixtools = ("ls ", "wc ", "tail ", "head ", "grep ", "find ", "cat ",
+                      "chmod", "pwd", "mkdir ", "rm ", "touch ", "diff ", "sort ",
+                      "cut ", "awk ", "sed ", "tee ", "history", "cp ", "mv ",
+                      ";  ", "source ", "./")
+        lower = " " + (cmd or "").lower() + " "
+        uses_unix = any(u in lower for u in unixtools)
+        sh = shutil.which("sh")
+        if uses_unix and sh:
+            shell = [sh, "-c", cmd]
+        else:
+            shell = ["cmd", "/c", cmd]
     else:
         shell = ["sh", "-c", cmd]
     proc = await asyncio.create_subprocess_exec(
@@ -219,7 +273,7 @@ async def _run_command(cmd: str, workspace: str):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
     return type("R", (), {"returncode": proc.returncode, "stdout": stdout.decode(errors="replace"), "stderr": stderr.decode(errors="replace")})
 
 
@@ -241,10 +295,11 @@ def _get_tavily_key() -> str:
     try:
         from .models import AppConfig
         from .db import SessionLocal
+        from .secure import decrypt
         db = SessionLocal()
         try:
             row = db.query(AppConfig).filter(AppConfig.key == "tavily_api_key").first()
-            return (row.value or "") if row else ""
+            return decrypt(row.value) if (row and row.value) else ""
         finally:
             db.close()
     except Exception:

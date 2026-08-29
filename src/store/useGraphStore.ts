@@ -662,6 +662,17 @@ export const useGraphStore = create<GraphState>()((set, get) => {
           return { nodes: { ...s.nodes, [event.nodeId]: { ...n, status: event.status } } };
         });
       }
+      if (event.type === 'usage') {
+        // 会话级用量/费用实时推送
+        set((s) => {
+          const u = { ...s.sessionUsage };
+          if (event.promptTokens !== undefined) u.promptTokens = event.promptTokens;
+          if (event.completionTokens !== undefined) u.completionTokens = event.completionTokens;
+          if (event.cost !== undefined) u.cost = event.cost;
+          u.balance = u.budget != null ? +(u.budget - u.cost).toFixed(6) : null;
+          return { sessionUsage: u };
+        });
+      }
       if (event.type === 'approval' && event.approvalId) {
         set({
           pendingApproval: {

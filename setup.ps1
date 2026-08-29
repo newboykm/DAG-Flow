@@ -3,11 +3,13 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1
 #
 # 用法：
-#   setup.ps1              # 安装基础依赖（npm + pip）
-#   setup.ps1 -WithRag     # 额外安装 sentence-transformers + bge 语义模型（体积大，需要网络）
+#   setup.ps1                        # 安装基础依赖（npm + pip；含 API Key 加密、图片 OCR、MCP、RAG 向量库）
+#   setup.ps1 -WithRag               # 额外安装 sentence-transformers + bge 语义模型（体积大）
+#   setup.ps1 -WithRag -WithReranker # 额外再加 bge-reranker 精排模型（更大，约 1.1GB）
 #
 param(
-    [switch]$WithRag
+    [switch]$WithRag,
+    [switch]$WithReranker
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +70,26 @@ if ($WithRag) {
     }
 } else {
     Step '[3/4] 跳过 RAG 依赖（如需语义检索，运行：setup.ps1 -WithRag）'
+}
+
+# ---------- 可选 Reranker（精排）模型 ----------
+if ($WithReranker) {
+    Step '下载 Reranker 模型 bge-reranker-base（约 1.1GB，分段下载）...'
+    $RrFile = Join-Path $Root 'models\bge-reranker-base\model.safetensors'
+    if (Test-Path $RrFile) {
+        Write-Host '  Reranker 模型已存在，跳过下载' -ForegroundColor Green
+    } else {
+        Push-Location $BackendDir
+        try {
+            python download_model.py --reranker
+            if ($LASTEXITCODE -ne 0) { throw "Reranker 下载失败" }
+        } finally {
+            Pop-Location
+        }
+        Write-Host '  Reranker 模型下载完成' -ForegroundColor Green
+    }
+} else {
+    Write-Host '  跳过 Reranker 模型（如需精排，运行：setup.ps1 -WithReranker）' -ForegroundColor DarkGray
 }
 
 Step '全部依赖安装完成！'

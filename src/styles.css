@@ -272,14 +272,24 @@ body {
   border-radius: 14px;
   padding: 22px;
   box-shadow: 0 20px 60px rgba(15, 23, 42, 0.3);
-  overflow-y: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   overscroll-behavior: contain;
+}
+.modal-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   scrollbar-width: thin;
 }
-.modal::-webkit-scrollbar {
+.modal::-webkit-scrollbar,
+.modal-scroll::-webkit-scrollbar {
   width: 8px;
 }
-.modal::-webkit-scrollbar-thumb {
+.modal::-webkit-scrollbar-thumb,
+.modal-scroll::-webkit-scrollbar-thumb {
   background: #d9d9e3;
   border-radius: 999px;
 }
@@ -647,6 +657,7 @@ body {
   cursor: pointer;
   font-size: 12px;
   color: #1e293b;
+  overflow: hidden; /* 收缩时裁剪折叠态内容溢出（右键菜单已用 Portal 到 body，不受此裁剪） */
 }
 /* 卡片内所有文字统一 12px（继承 dag-node 基准，去掉各组件的大小差异） */
 .dag-node .card-title,
@@ -906,6 +917,11 @@ body {
 
 .card-body-collapsed {
   padding: 6px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow: hidden;
 }
 .card-progress {
   height: 4px;
@@ -953,13 +969,17 @@ body {
 }
 .card-append-quick {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 8px;
   padding-top: 6px;
   border-top: 1px solid #f1f5f9;
+  min-width: 0;
+  max-width: 100%;
 }
 .quick-btn {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
   border: 1px solid #e2e8f0;
   background: #fff;
   border-radius: 7px;
@@ -969,6 +989,8 @@ body {
   color: #475569;
   cursor: pointer;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: all 0.15s;
 }
 .quick-btn:hover {
@@ -1856,8 +1878,8 @@ body {
 
 /* ---------- Context menu ---------- */
 .ctx-menu {
-  position: absolute;
-  z-index: 10000;
+  position: fixed;
+  z-index: 30000;
   min-width: 140px;
   background: #fff;
   border: 1px solid #e2e8f0;
@@ -1930,4 +1952,65 @@ body {
   font-size: 12px;
   color: var(--muted);
   text-align: center;
+}
+
+/* ---- 执行过程折叠块 ---- */
+.exec-fold {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fafafb;
+  margin: 2px 0 8px;
+  overflow: hidden;
+}
+.exec-fold summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  font-size: 10px;   /* 比回复正文再小两号 */
+  color: var(--text);
+  font-weight: 600;
+  user-select: none;
+}
+.exec-fold summary::-webkit-details-marker { display: none; }
+.exec-fold-icon { font-size: 10px; }
+.exec-fold-chevron { margin-left: auto; color: var(--muted); }
+.exec-fold[open] .exec-fold-chevron::before { content: '▾'; }
+.exec-fold:not([open]) .exec-fold-chevron::before { content: '▸'; }
+.exec-fold-body {
+  border-top: 1px solid var(--border);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 10px;   /* 比回复正文再小两号 */
+}
+.agent-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 10px;   /* 比回复正文再小两号 */
+  color: var(--muted);
+  line-height: 1.45;
+}
+.agent-step .input-icon { flex-shrink: 0; margin-top: 1px; }
+.agent-step-label { font-weight: 600; color: var(--text); flex-shrink: 0; }
+.agent-step-detail { color: var(--muted); overflow-wrap: anywhere; }
+.agent-step-run .agent-step-label { color: #0a58ca; }
+.agent-step-done { opacity: 0.8; }
+.agent-step-pending .agent-step-detail { font-style: italic; }
+
+/* ---- 聊天分组（消息 + 其下方执行块） ---- */
+.chat-group { margin-bottom: 2px; }
+
+.exec-step-count {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
 }

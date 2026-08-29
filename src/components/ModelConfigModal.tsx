@@ -162,6 +162,7 @@ export default function ModelConfigModal() {
   return (
     <div className="modal-overlay" onClick={() => setOpen(false)}>
       <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-scroll">
         <div className="modal-title">设置</div>
         <div className="modal-sub">为各服务商填入 API Key（可填多个），卡片内可选用任一已配置模型。</div>
 
@@ -172,7 +173,7 @@ export default function ModelConfigModal() {
               <input
                 type="password"
                 value={p.apiKey}
-                placeholder="API Key（留空则不可用）"
+                placeholder="API Key（多把 key 用逗号/分号分隔）"
                 onChange={(e) => setField(p.provider, 'apiKey', e.target.value)}
               />
             </div>
@@ -276,6 +277,7 @@ export default function ModelConfigModal() {
           <button className="btn btn-primary" disabled={saving || !hasAnyKey} onClick={save}>
             {saving ? '保存中…' : '保存并启用'}
           </button>
+        </div>
         </div>
       </div>
     </div>

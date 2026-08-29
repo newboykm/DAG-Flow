@@ -27,6 +27,29 @@ _client = None
 _ef = None
 _EF_READY = False
 
+# Reranker（交叉编码器精排）专用模型；缺失/加载失败时自动降级为 embedding 顺序
+_RERANK_MODEL_DIR = os.path.join(_BACKEND_DIR, "..", "models", "bge-reranker-base")
+_reranker = None
+_RERANK_READY = False
+
+
+def _get_reranker():
+    """懒加载 bge-reranker-base 交叉编码器；失败返回 None（降级不重排）。"""
+    global _reranker, _RERANK_READY
+    if _RERANK_READY:
+        return _reranker
+    _RERANK_READY = True
+    try:
+        from sentence_transformers import CrossEncoder
+        dirp = _RERANK_MODEL_DIR
+        if os.path.isdir(dirp) and os.path.exists(os.path.join(dirp, "model.safetensors")):
+            _reranker = CrossEncoder(str(dirp))
+        else:
+            _reranker = None
+    except Exception:
+        _reranker = None
+    return _reranker
+
 
 def _get_client():
     global _client
@@ -99,21 +122,29 @@ def add_block(session_id: str, node_id: str, seq: int, title: str, text: str) ->
     )
 
 
-def search(session_id: str, query: str, parent_ids: list[str], top_k: int = 4) -> list[dict]:
-    """语义检索召回与 query 最相关的内容块（限定在父节点集合内）。"""
+def search(session_id: str, query: str, parent_ids: list[str], top_k: int = 4, retrieval_k: int = 0) -> list[dict]:
+    """语义检索召回与 query 最相关的内容块（限定在父节点集合内），并做 Reranker 精排。
+
+    流程（业界 RAG 双阶段）：召回(recall, bge embedding) → 精排(rerank, bge-reranker)。
+    - 先按 embedding 召回比 top_k 更多的候选（retrieval_k，默认 max(12, top_k*3)）；
+    - 若 bge-reranker 可用，用其按 query 与候选相关性重新打分，取 top_k；
+    - 重排器不可用时，退回 embedding 相似度顺序（不阻塞）。
+    """
+    if retrieval_k <= 0:
+        retrieval_k = max(12, top_k * 3)
     col = _collection(session_id)
     qemb = _embed_texts([query])[0]
-    res = col.query(query_embeddings=[qemb], n_results=min(top_k, 20))
+    res = col.query(query_embeddings=[qemb], n_results=min(retrieval_k, 50))
     ids = res.get("ids", [[]])[0]
     docs = res.get("documents", [[]])[0] if res.get("documents") else []
     metas = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
-    out: list[dict] = []
+    cands: list[dict] = []
     for i, doc_id in enumerate(ids):
         meta = metas[i] if i < len(metas) else {}
         node_id = meta.get("nodeId", "")
         if parent_ids and node_id not in parent_ids:
             continue
-        out.append(
+        cands.append(
             {
                 "id": doc_id,
                 "nodeId": node_id,
@@ -122,4 +153,19 @@ def search(session_id: str, query: str, parent_ids: list[str], top_k: int = 4) -
                 "text": (docs[i] if i < len(docs) else ""),
             }
         )
-    return out
+    if not cands:
+        return []
+    if len(cands) <= top_k:
+        return cands[:top_k]
+    # Reranker 精排
+    reranker = _get_reranker()
+    if reranker is not None:
+        try:
+            texts = [f"{c.get('text','')[:400]}" for c in cands]
+            pairs = [[query, t] for t in texts]
+            scores = reranker.predict(pairs, show_progress_bar=False)
+            scored = sorted(zip(cands, scores), key=lambda x: x[1], reverse=True)
+            return [c for c, _ in scored[:top_k]]
+        except Exception:
+            pass  # 精排失败退回召回顺序
+    return cands[:top_k]

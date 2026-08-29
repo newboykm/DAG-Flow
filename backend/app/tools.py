@@ -56,7 +56,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="exec_command",
-        description="在工作目录内执行一条 shell 命令并返回 stdout/stderr。",
+        description="在工作目录内执行一条命令并返回 stdout/stderr。运行环境为 Windows，已兼容常见类 Unix 命令（ls/wc/tail/grep/cat/find 等会经 Git-bash 执行）；改文件建议用 write_file，删除/危险命令需审批。",
         parameters={
             "type": "object",
             "properties": {
@@ -190,6 +190,34 @@ TOOLS: list[Tool] = [
             "required": ["task"],
         },
     ),
+    Tool(
+        name="run_python",
+        description=(
+            "在工作目录内执行一段 Python 代码并返回 stdout/stderr。用于计算、解析、快速验证、数据加工等；"
+            "注意：代码在受控沙箱中运行，无法联网、无法访问工作目录外路径。写文件/删文件等操作请用 write_file 或显式属于敏感命令。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "要执行的 Python 代码"},
+            },
+            "required": ["code"],
+        },
+    ),
+    Tool(
+        name="read_image",
+        description=(
+            "读取工作目录内的图片/二进制文本文件，返回其内容概要（UTF-8 可读部分；若为图片，返回文件大小与是否为图片等元信息，"
+            "暂不提供视觉识别）。主要用于判断文件是否存在、类型与大小。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径"},
+            },
+            "required": ["path"],
+        },
+    ),
 ]
 
 TOOL_BY_NAME: dict[str, Tool] = {t.name: t for t in TOOLS}
@@ -233,9 +261,12 @@ def command_needs_approval(command: str) -> bool:
 
 
 def needs_approval(name: str, args: dict) -> bool:
-    """动态审批判定：write_file 在工作目录内免审；exec_command 按命令内容判定。"""
+    """动态审批判定：exec_command 按命令内容判定；run_python 执行任意代码需审批；write_file 免审。"""
     if name == "exec_command":
         return command_needs_approval(args.get("command", ""))
+    if name == "run_python":
+        # 能执行任意代码 → 需人工审批（防越权/危险操作）
+        return True
     # write_file：普通写文件免审（路径越界由 tool_executor._safe_path 拒绝）
     return False
 

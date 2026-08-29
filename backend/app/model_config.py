@@ -34,9 +34,50 @@ class ModelProvider(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)  # provider key
     label: Mapped[str] = mapped_column(String, default="")
     baseUrl: Mapped[str] = mapped_column(String, default="")
-    apiKey: Mapped[str] = mapped_column(Text, default="")
     models: Mapped[list[str]] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # 敏感字段「透明加密」：DB 列名仍是 apiKey，但读写自动加解密，调用方拿到的都是明文
+    _apiKey: Mapped[str] = mapped_column("apiKey", Text, default="")
+
+    @property
+    def apiKey(self) -> str:
+        """主 key（第一个），保持旧调用兼容。多 key 时请用 api_keys。"""
+        return self.api_keys[0] if self.api_keys else ""
+
+    @apiKey.setter
+    def apiKey(self, value: str) -> None:
+        from .secure import encrypt
+        self._apiKey = encrypt(value or "")
+
+    @property
+    def api_keys(self) -> list[str]:
+        """拆分后的全部 key：多个 key 用换行 / 逗号 / 分号 / 「|||」分隔。"""
+        from .secure import decrypt
+        raw = (decrypt(self._apiKey) or "").strip()
+        if not raw:
+            return []
+        import re as _re
+        parts = [p.strip() for p in _re.split(r"\n|,|;|\|\|\|", raw) if p.strip()]
+        return parts
+
+    # 轮询游标（进程级）：多 provider 各自独立计数，避免同时打同一 key
+    _key_cursor: dict[str, int] = {}
+
+    def pick_api_key(self) -> str:
+        """轮询返回一把 key；同一 provider 的多 key 均摊负载。"""
+        keys = self.api_keys
+        if not keys:
+            return ""
+        c = ModelProvider._key_cursor.get(self.id, 0)
+        ModelProvider._key_cursor[self.id] = c + 1
+        return keys[c % len(keys)]
+
+    @property
+    def api_key_full(self) -> str:
+        """完整的明文 key 串（含多 key 分隔符），供前端编辑往返。"""
+        from .secure import decrypt
+        return decrypt(self._apiKey) or ""
 
 
 # 旧单配置表保留兼容
@@ -46,8 +87,20 @@ class ModelConfig(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default="default")
     provider: Mapped[str] = mapped_column(String, default="")
     baseUrl: Mapped[str] = mapped_column(String, default="")
-    apiKey: Mapped[str] = mapped_column(Text, default="")
     model: Mapped[str] = mapped_column(String, default="")
+
+    # 同透明加解密
+    _apiKey: Mapped[str] = mapped_column("apiKey", Text, default="")
+
+    @property
+    def apiKey(self) -> str:
+        from .secure import decrypt
+        return decrypt(self._apiKey)
+
+    @apiKey.setter
+    def apiKey(self, value: str) -> None:
+        from .secure import encrypt
+        self._apiKey = encrypt(value or "")
 
 
 def seed_providers(db) -> None:

@@ -67,6 +67,9 @@ export interface NodeProgress {
   elapsedMs: number;
   /** 总预计耗时（用于进度条） */
   expectedMs: number;
+  /** 计划完成度：已完成步骤 / 总步骤（用于进度条） */
+  stepDone?: number;
+  stepTotal?: number;
 }
 
 export interface NodeMeta {

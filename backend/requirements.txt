@@ -6,3 +6,5 @@ python-multipart==0.0.32
 chromadb==0.5.5
 httpx==0.28.1
 fastmcp==3.4.7
+cryptography==50.0.1
+rapidocr_onnxruntime==1.4.4

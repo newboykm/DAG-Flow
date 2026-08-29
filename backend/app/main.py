@@ -55,6 +55,24 @@ def _migrate():
     if "context_blocks" not in insp.get_table_names():
         Base.metadata.create_all(bind=engine)
 
+    # 存量敏感字段迁移：把已明文存储的 API key 加密落盘（兼容幂等，加密失败会回落明文）
+    try:
+        from . import db as _db_ctx
+        from .secure import is_encrypted, encrypt
+        session = _db_ctx.SessionLocal()
+        try:
+            changed = False
+            for p in session.query(ModelProvider).all():
+                if p.apiKey and not is_encrypted(p._apiKey):
+                    p._apiKey = encrypt(p.apiKey)  # property 读明文 -> 写密文
+                    changed = True
+            if changed:
+                session.commit()
+        finally:
+            session.close()
+    except Exception:
+        pass  # 迁移失败不影响启动
+
 
 app = FastAPI(title="会话任务 DAG 卡片后端", version="0.1.0", lifespan=lifespan)
 
@@ -136,7 +154,7 @@ def get_model_config(db: OrmSession = Depends(get_db)):
                 "provider": p.id,
                 "label": p.label,
                 "baseUrl": p.baseUrl,
-                "apiKey": p.apiKey,
+                "apiKey": p.api_key_full,
                 "models": p.models or [],
                 "enabled": usable,
             }
@@ -686,20 +704,23 @@ def put_skills(body: dict, db: OrmSession = Depends(get_db)):
 
 @app.get("/api/config/tavily")
 def get_tavily_config(db: OrmSession = Depends(get_db)):
-    """返回 Tavily 搜索 API key 配置。"""
+    """返回 Tavily 搜索 API key 配置（前端回显明文）。"""
+    from .secure import decrypt
     row = db.query(AppConfig).filter(AppConfig.key == "tavily_api_key").first()
-    return {"apiKey": (row.value if row else None) or ""}
+    return {"apiKey": decrypt(row.value) if row else ""}
 
 
 @app.put("/api/config/tavily")
 def put_tavily_config(body: dict, db: OrmSession = Depends(get_db)):
-    """保存 Tavily 搜索 API key。"""
+    """保存 Tavily 搜索 API key（敏感字段加密存储）。"""
+    from .secure import encrypt
     api_key = (body.get("apiKey") or "").strip()
+    stored = encrypt(api_key)
     row = db.query(AppConfig).filter(AppConfig.key == "tavily_api_key").first()
     if row:
-        row.value = api_key
+        row.value = stored
     else:
-        db.add(AppConfig(key="tavily_api_key", value=api_key))
+        db.add(AppConfig(key="tavily_api_key", value=stored))
     db.commit()
     return {"apiKey": api_key}
 
@@ -799,6 +820,18 @@ async def upload_node_file(nid: str, file: UploadFile = File(...), db: OrmSessio
     db.commit()
     db.refresh(n)
     return _node_out(n)
+
+
+@app.post("/api/ocr")
+async def ocr_upload(file: UploadFile = File(...)):
+    """接收图片并 OCR 识别，返回识别文本（用于多模态：图片 → 文本 → 模型）。"""
+    from .ocr import ocr_image
+    content = await file.read()
+    if not content:
+        return {"text": ""}
+    # 尝试从文件名判断扩展名；用内存 bytes 直接 OCR
+    text = ocr_image(content)
+    return {"text": text}
 
 
 @app.websocket("/ws/sessions/{sid}")
