@@ -5,7 +5,6 @@ import GlobalAppendBar from './components/GlobalAppendBar';
 import FilterBar from './components/FilterBar';
 import FlowCanvas from './components/FlowCanvas';
 import ModelConfigModal from './components/ModelConfigModal';
-import ApprovalPrompt from './components/ApprovalPrompt';
 import UsageBar from './components/UsageBar';
 import { initApp } from './store/useGraphStore';
 
@@ -25,7 +24,6 @@ export default function App() {
         <UsageBar />
       </div>
       <ModelConfigModal />
-      <ApprovalPrompt />
     </div>
   );
 }

@@ -28,6 +28,7 @@ interface Props {
 export default function TaskNodeCard(props: Props) {
   const { node, x, y, width, height, collapsed, isAnchor, dim, sourceSelected, zoomed, zoomComp, childrenCount, inWindow } = props;
   const meta = STATUS_META[node.status];
+  const approval = useGraphStore((s) => s.approvalsByNode[node.nodeId]);
   const clickTimer = useRef<number | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -665,6 +666,40 @@ export default function TaskNodeCard(props: Props) {
               </select>
             </div>
           </div>
+
+          {approval ? (
+            <div className="card-approval" onClick={(e) => e.stopPropagation()}>
+              <div className="card-approval-title">⚠ 工具待审批</div>
+              <div className="card-approval-tool">{approval.tool}</div>
+              {approval.args ? (
+                <pre className="card-approval-args">
+                  {Object.entries(approval.args)
+                    .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+                    .join('\n')}
+                </pre>
+              ) : null}
+              <div className="card-approval-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useGraphStore.getState().approveApproval(approval.approvalId, node.nodeId);
+                  }}
+                >
+                  允许
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    useGraphStore.getState().rejectApproval(approval.approvalId, node.nodeId);
+                  }}
+                >
+                  拒绝
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <div className="card-actions">
             {node.status === 'blocked' ? (

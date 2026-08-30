@@ -105,7 +105,12 @@ def build_messages(
         role = m.get("role")
         text = m.get("text", "")
         if role in ("user", "assistant") and text:
-            msgs.append({"role": role, "content": text[:2000]})
+            msg = {"role": role, "content": text[:2000]}
+            # deepseek thinking 模式：assistant 的历史 reasoning_content 需原样回传
+            rc = m.get("reasoning_content")
+            if role == "assistant" and rc:
+                msg["reasoning_content"] = rc[:4000]
+            msgs.append(msg)
 
     msgs.append({"role": "user", "content": user_text})
     return msgs
@@ -158,11 +163,37 @@ async def stream_chat_with_tools(
     payload: dict = {"model": model, "messages": messages, "stream": True, "temperature": temperature}
     if tools:
         payload["tools"] = tools
+        # deepseek 等兼容端点有时需要显式 tool_choice，避免 400
+        payload["tool_choice"] = "auto"
     import json as _json
     tool_calls_acc: dict[int, dict] = {}
+    reasoning_acc = ""
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                # 打印出供应商返回的具体错误，便于定位 400 原因
+                print(
+                    "[LLM 400]",
+                    resp.status_code,
+                    body.decode("utf-8", errors="replace")[:1500],
+                    flush=True,
+                )
+                # 打印最后 5 条消息的结构，便于定位不足的 tool 消息
+                try:
+                    for _m in messages[-5:]:
+                        _role = _m.get("role")
+                        _info = {
+                            "role": _role,
+                            "has_tool_calls": bool(_m.get("tool_calls")),
+                            "tool_call_ids": [t.get("id") for t in (_m.get("tool_calls") or [])] if _m.get("tool_calls") else None,
+                            "tool_call_id": _m.get("tool_call_id"),
+                            "has_reasoning": "reasoning_content" in _m,
+                        }
+                        print("[LLM 400 msg]", _json.dumps(_info, ensure_ascii=False), flush=True)
+                except Exception:
+                    pass
+                resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue
@@ -175,6 +206,8 @@ async def stream_chat_with_tools(
                     continue
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 content = delta.get("content")
+                if delta.get("reasoning_content"):
+                    reasoning_acc += delta["reasoning_content"]
                 if content:
                     yield {"type": "delta", "text": content}
                 for tc in delta.get("tool_calls") or []:
@@ -187,7 +220,7 @@ async def stream_chat_with_tools(
                     if tc.get("function", {}).get("arguments"):
                         acc["function"]["arguments"] += tc["function"]["arguments"]
     ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
-    yield {"type": "done", "tool_calls": ordered}
+    yield {"type": "done", "tool_calls": ordered, "reasoning_content": reasoning_acc}
 
 
 async def stream_final(

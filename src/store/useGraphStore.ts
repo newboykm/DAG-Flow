@@ -20,7 +20,7 @@ interface GraphState {
   sessionId: string;
   sessionTitle: string;
   sessions: { sessionId: string; title: string | null; workspace: string | null; createdAt: string; updatedAt: string }[];
-  pendingApproval: { approvalId: string; nodeId: string; tool: string; args: any } | null;
+  approvalsByNode: Record<string, { approvalId: string; tool: string; args: any }>;
   settingsOpen: boolean;
   availableModels: { provider: string; label: string; model: string }[];
   sessionUsage: { promptTokens: number; completionTokens: number; cost: number; budget: number | null; balance: number | null };
@@ -51,8 +51,8 @@ interface GraphState {
   setNodeModel: (id: string, model: string) => Promise<void>;
   uploadNodeFile: (id: string, file: File) => Promise<void>;
   setSessionBudget: (budget: number | null) => Promise<void>;
-  approveApproval: (aid: string) => Promise<void>;
-  rejectApproval: (aid: string) => Promise<void>;
+  approveApproval: (aid: string, nodeId: string) => Promise<void>;
+  rejectApproval: (aid: string, nodeId: string) => Promise<void>;
   setSettingsOpen: (open: boolean) => void;
   resolveContext: (key: string, action: 'keep_first' | 'keep_second' | 'merge', mergeValue?: string) => Promise<void>;
   refreshGraph: () => Promise<void>;
@@ -114,7 +114,7 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     sessions: [],
     availableModels: [],
     sessionUsage: { promptTokens: 0, completionTokens: 0, cost: 0, budget: null, balance: null },
-    pendingApproval: null,
+    approvalsByNode: {},
     settingsOpen: false,
     contextVersion: 0,
     contextEntries: [],
@@ -194,14 +194,27 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       try {
         await api.deleteSession(sid);
         const s = get();
-        // 删除后刷新列表；若删除的是当前会话，则加载最近一个或新建
+        // 删除后刷新列表；若删除的是当前会话，则加载最近一个；若已无会话则清空画布（不自动新建）
         const sessions = (await api.listSessions()).filter((x) => x.sessionId !== sid);
         set({ sessions });
         if (s.sessionId === sid) {
+          clearWs();
           if (sessions.length > 0) {
             await s.loadSession(sessions[0].sessionId);
           } else {
-            await s.newSession();
+            set({
+              nodes: {},
+              rootId: '',
+              sessionId: '',
+              sessionTitle: '',
+              anchorIds: [],
+              selectingSource: false,
+              sourceIds: [],
+              approvalsByNode: {},
+              contextVersion: 0,
+              contextEntries: [],
+              sessionUsage: { promptTokens: 0, completionTokens: 0, cost: 0, budget: null, balance: null },
+            });
           }
         }
       } catch (e) {
@@ -270,10 +283,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       }
     },
 
-    approveApproval: async (aid) => {
+    approveApproval: async (aid, nodeId) => {
       try {
         await api.approveApproval(aid);
-        set({ pendingApproval: null });
+        set((s) => {
+          const m = { ...s.approvalsByNode };
+          delete m[nodeId];
+          return { approvalsByNode: m };
+        });
       } catch (e) {
         console.error('审批通过失败', e);
       }
@@ -281,10 +298,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 
     setSettingsOpen: (open) => set({ settingsOpen: open }),
 
-    rejectApproval: async (aid) => {
+    rejectApproval: async (aid, nodeId) => {
       try {
         await api.rejectApproval(aid);
-        set({ pendingApproval: null });
+        set((s) => {
+          const m = { ...s.approvalsByNode };
+          delete m[nodeId];
+          return { approvalsByNode: m };
+        });
       } catch (e) {
         console.error('审批拒绝失败', e);
       }
@@ -301,12 +322,17 @@ export const useGraphStore = create<GraphState>()((set, get) => {
         nodes,
         rootId: rootNode?.nodeId ?? (graph.nodes[0]?.nodeId ?? get().rootId),
       });
-      // 兜底：若存在待审批（错过了 WS 事件），主动拉取并弹出
+      // 兜底：若存在待审批（错过了 WS 事件），按 nodeId 分组写入
       try {
         const pendings = await api.getPendingApprovals(sid);
-        const cur = get().pendingApproval;
-        if (pendings.length > 0 && (!cur || cur.approvalId !== pendings[0].approvalId)) {
-          set({ pendingApproval: pendings[0] });
+        if (pendings.length > 0) {
+          set((s) => {
+            const m = { ...s.approvalsByNode };
+            for (const p of pendings) {
+              m[p.nodeId] = { approvalId: p.approvalId, tool: p.tool, args: p.args };
+            }
+            return { approvalsByNode: m };
+          });
         }
       } catch {
         /* ignore */
@@ -453,18 +479,13 @@ export const useGraphStore = create<GraphState>()((set, get) => {
     },
 
     retryNode: async (id) => {
-      const s = get();
       try {
         const node = await api.retryNode(id);
-        set((st) => ({
-          nodes: upsertNode(st.nodes, toDagNode(node)),
-          collapsed: { ...st.collapsed, [node.nodeId]: false },
-          fitNonce: st.fitNonce + 1,
-        }));
+        // 原地重试：返回的是同一个节点，直接覆盖本地状态
+        set((st) => ({ nodes: upsertNode(st.nodes, toDagNode(node)) }));
       } catch (e) {
         console.error('重试失败', e);
       }
-      void s;
     },
 
     removeNode: async (id) => {
@@ -673,15 +694,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
           return { sessionUsage: u };
         });
       }
-      if (event.type === 'approval' && event.approvalId) {
-        set({
-          pendingApproval: {
-            approvalId: event.approvalId,
-            nodeId: event.nodeId,
-            tool: event.tool,
-            args: event.args,
+      if (event.type === 'approval' && event.approvalId && event.nodeId) {
+        // 按卡片记录待审批（多卡片并发各存各的，互不覆盖）
+        set((s) => ({
+          approvalsByNode: {
+            ...s.approvalsByNode,
+            [event.nodeId]: { approvalId: event.approvalId, tool: event.tool, args: event.args },
           },
-        });
+        }));
       }
       if (event.type === 'parent_context_updated' && event.nodeId) {
         // 父节点发布新内容块：更新下游节点的父上下文索引
@@ -716,14 +736,14 @@ export const useGraphStore = create<GraphState>()((set, get) => {
 });
 
 export function initApp(): void {
-  // 应用启动：加载历史列表和可用模型；有历史则载入最近一个，完全没有历史时才新建一次。
+  // 应用启动：只加载历史列表和可用模型；若已有历史会话则载入最近一个。
+  // 不自动新建会话：新建会话只能由用户点击左侧栏「＋ 新建会话」触发。
   const st = useGraphStore.getState();
   st.loadAvailableModels();
   st.loadSessions().then(() => {
     const list = useGraphStore.getState().sessions;
     if (list.length > 0) {
-      return st.loadSession(list[0].sessionId);
+      void st.loadSession(list[0].sessionId);
     }
-    return st.newSession();
   });
 }

@@ -2014,3 +2014,45 @@ body {
   color: var(--muted);
   font-weight: 500;
 }
+
+/* ---------- 卡片内工具审批 ---------- */
+.card-approval {
+  border: 1px solid #fcd34d;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-top: 6px;
+}
+.card-approval-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b45309;
+}
+.card-approval-tool {
+  font-size: 12px;
+  color: #92400e;
+  font-weight: 600;
+  margin: 2px 0 4px;
+  word-break: break-all;
+}
+.card-approval-args {
+  background: #fff;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: #78350f;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 120px;
+  overflow-y: auto;
+  margin: 0 0 6px;
+}
+.card-approval-actions {
+  display: flex;
+  gap: 6px;
+}
+.card-approval-actions .btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}

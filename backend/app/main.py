@@ -478,26 +478,16 @@ def retry_node(nid: str, db: OrmSession = Depends(get_db)):
     n = db.get(Node, nid)
     if not n:
         raise HTTPException(status_code=404, detail="节点不存在")
-    # 重试 = 创建新节点，原节点保留（§4.2.6）
-    status = compute_initial_status(
-        {x.nodeId: x.status for x in db.query(Node).filter(Node.sessionId == n.sessionId).all()},
-        n.parentIds or [],
-    )
-    new_node = Node(
-        nodeId=_gen_id("n"),
-        sessionId=n.sessionId,
-        kind="task",
-        parentIds=n.parentIds or [],
-        title=f"{n.title}（重试）",
-        inputText=n.inputText,
-        status=status,
-        mode=n.mode,
-        retryOf=nid,
-    )
-    db.add(new_node)
+    # 原地重试：保留对话消息与输出，仅把状态重置为 ready/pending，由调度器重新执行当前节点
+    parents = {x.nodeId: x.status for x in db.query(Node).filter(Node.sessionId == n.sessionId).all()}
+    status = compute_initial_status(parents, n.parentIds or [])
+    # 清掉上一轮运行痕迹，但保留历史 messages 与历史 output
+    n.status = status
+    n.failedReason = None
+    n.progress = None
     db.commit()
-    db.refresh(new_node)
-    return _node_out(new_node)
+    db.refresh(n)
+    return _node_out(n)
 
 
 @app.post("/api/nodes/{nid}/resolve-blocked", response_model=NodeOut)
@@ -665,12 +655,11 @@ def browse_dir(path: str = ""):
 
 @app.get("/api/sessions/{sid}/approvals/pending")
 def pending_approvals(sid: str, db: OrmSession = Depends(get_db)):
-    """返回该会话当前的待审批记录（前端拉取兜底，避免错过 WS 事件）。"""
+    """返回该会话当前的待审批记录（前端拉取兜底，避免错过 WS 事件；按卡片分组展示）。"""
     rows = (
         db.query(Approval)
         .filter(Approval.sessionId == sid, Approval.status == "pending")
-        .order_by(Approval.createdAt.desc())
-        .limit(1)
+        .order_by(Approval.createdAt.asc())
         .all()
     )
     return [{"approvalId": a.id, "nodeId": a.nodeId, "tool": a.tool, "args": a.args} for a in rows]

@@ -726,6 +726,7 @@ async def _run_real(node_id: str) -> None:
 
             round_text = ""
             tool_calls: list[dict] = []
+            last_reasoning = ""
             async for ev in stream_chat_with_tools(cfg_base, provider.pick_api_key(), provider_model, messages, tools, temperature=0.2):
                 if cancelled():
                     break
@@ -737,6 +738,7 @@ async def _run_real(node_id: str) -> None:
                     await flush(all_text, True)
                 elif ev["type"] == "done":
                     tool_calls = ev["tool_calls"]
+                    last_reasoning = ev.get("reasoning_content", "")
 
             if cancelled():
                 break
@@ -748,6 +750,9 @@ async def _run_real(node_id: str) -> None:
                 # 把本轮 assistant 工具调用写入 messages，再逐个执行
                 await flush_step("调用工具", f"{len(tool_calls)} 个工具")
                 assistant_tool_msg = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+                # deepseek thinking 模式要求把 reasoning_content 原样回传，否则下一轮 400
+                if last_reasoning:
+                    assistant_tool_msg["reasoning_content"] = last_reasoning
                 messages.append(assistant_tool_msg)
                 for tc in tool_calls:
                     fn = tc.get("function", {})
@@ -809,6 +814,16 @@ async def _run_real(node_id: str) -> None:
                     messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
                     if is_failure(result):
                         await push_reflection(name, result)
+                # 兜底：确保每个 tool_call_id 都有对应 tool 消息（缺了补空结果），
+                # 避免 deepseek 报「insufficient tool messages following tool_calls」
+                tc_ids = {tc.get("id", "") for tc in tool_calls if tc.get("id")}
+                existing_ids = {
+                    m.get("tool_call_id")
+                    for m in messages
+                    if m.get("role") == "tool" and m.get("tool_call_id")
+                }
+                for missing in tc_ids - existing_ids:
+                    messages.append({"role": "tool", "tool_call_id": missing, "content": "（该工具未返回结果）"})
                 continue  # 继续下一轮
             else:
                 # 本轮没有工具调用：保留已有 acc（可能是空，说明模型直接给文本或结束）
@@ -844,6 +859,14 @@ async def _run_real(node_id: str) -> None:
 
         final_text = acc or "（本次执行无文本输出）"
         await flush(final_text, False)
+        # 把最终一轮的 reasoning_content 写进最后一条 assistant 消息，供下一轮回传
+        if last_reasoning:
+            msgs = list(node.messages or [])
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") == "assistant":
+                    msgs[i] = {**msgs[i], "reasoning_content": last_reasoning}
+                    break
+            node.messages = msgs
 
         # 计划收尾：把剩余步骤全部标记完成
         import copy
@@ -931,14 +954,19 @@ async def _run_subagent(
     acc = ""
     for _ in range(max(1, min(max_rounds, 6))):
         tool_calls: list[dict] = []
+        reasoning = ""
         async for ev in stream_chat_with_tools(provider.baseUrl.rstrip("/"), provider.pick_api_key(), model, messages, tools, temperature=0.2):
             if ev["type"] == "delta":
                 acc += ev["text"]
             elif ev["type"] == "done":
                 tool_calls = ev["tool_calls"]
+                reasoning = ev.get("reasoning_content", "")
         if not tool_calls:
             break
-        messages.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+        assistant_msg = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+        if reasoning:
+            assistant_msg["reasoning_content"] = reasoning
+        messages.append(assistant_msg)
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name", "")
