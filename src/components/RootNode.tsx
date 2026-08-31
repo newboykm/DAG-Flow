@@ -56,20 +56,20 @@ export default function RootNode({ node, x, y, width, height, isAnchor, dim, sou
   return (
     <div
       className={cls}
-      style={{ left: x, top: y, width, height }}
+      style={{
+        left: x + (width - 20) / 2,
+        top: y + (height - 20) / 2,
+        width: 20,
+        height: 20,
+      }}
       onClick={handleClick}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
-      title={isAnchor ? '会话起点（已设为锚点，可拖动）' : '会话起点（点击设为锚点，可拖动）'}
+      title={isAnchor ? '会话起点（圆点，可拖动；已设为锚点）' : '会话起点（圆点，可拖动；点击设为锚点）'}
     >
-      <div className="root-pill">
-        <span className="root-dot" />
-        <span className="root-label">会话起点</span>
-        {isAnchor ? <span className="root-anchor-hint">锚点</span> : null}
-        {sourceSelected ? <span className="source-badge">✓ 已选</span> : null}
-      </div>
+      <span className={`root-dot ${isAnchor ? 'is-anchor' : ''} ${sourceSelected ? 'is-selected' : ''}`} />
     </div>
   );
 }

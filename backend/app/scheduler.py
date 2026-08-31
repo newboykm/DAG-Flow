@@ -11,7 +11,7 @@ from typing import Any
 
 from .db import SessionLocal
 from .models import Node, Session, ContextEntry, ContextBlock, Approval
-from .dag import compute_initial_status, is_terminal
+from .dag import compute_initial_status, is_terminal, running_relatives
 from .executor import (
     stream_chat,
     stream_final,
@@ -25,6 +25,7 @@ from .tools import openai_tools, TOOL_BY_NAME, needs_approval
 from .pricing import compute_cost
 from .tool_executor import execute
 from .model_config import ModelConfig, ModelProvider
+from .event_log import EventLog, clear_events
 
 CONCURRENCY = 5
 TICK_SECONDS = 1.0
@@ -153,20 +154,33 @@ async def _rolling_memory(provider, model: str, old_memory: dict | None, user_te
         summary = expect_str(obj, "summary", "") or old_summary or final_text[:150]
         key_facts = [str(f) for f in expect_list(obj, "key_facts", []) if str(f).strip()]
         conclusion = expect_str(obj, "conclusion", "")
-        return _prune_memory(
+        out = _prune_memory(
             summary=summary,
             key_facts=key_facts[:8],
             conclusion=conclusion,
             archive=old.get("archive") or [],
         )
+        out.update(_retain_goal_fields(old))
+        return out
     except Exception:
         # 回退：合并旧摘要与本轮产出简单拼接
-        return _prune_memory(
+        out = _prune_memory(
             summary=f"{old_summary}; {final_text[:120]}".strip("; "),
             key_facts=old_facts,
             conclusion=final_text[:200],
             archive=old.get("archive") or [],
         )
+        out.update(_retain_goal_fields(old))
+        return out
+
+
+def _retain_goal_fields(old: dict) -> dict:
+    """从旧 memory 保留 goal 自动延续相关的字段（否则 _rolling_memory 会覆盖丢目标）。"""
+    keep = {}
+    for k in ("goal", "goal_round", "goal_max_rounds"):
+        if old.get(k):
+            keep[k] = old[k]
+    return keep
 
 
 def _prune_memory(
@@ -430,6 +444,192 @@ def _mark_conflict(entry: ContextEntry, node: Node, new_value: str) -> None:
     entry.sourceNodeId = None  # 冲突态下无单一来源
 
 
+def _goal_done_marked(text: str | None) -> bool:
+    """判断最终文本是否声明了当前目标已完成（[GOAL_DONE]）。"""
+    return bool(text and "[GOAL_DONE]" in text)
+
+
+def _todo_summary(parsed: dict) -> str:
+    """把 todo_write 的 todos 清单压缩成一行便于展示。"""
+    todos = parsed.get("todos") or []
+    parts = []
+    for t in todos:
+        c = str(t.get("content", ""))[:30]
+        s = t.get("status", "pending")
+        mark = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}.get(s, "⬜")
+        parts.append(f"{mark}{c}")
+    return " | ".join(parts) if parts else "（空）"
+
+
+async def _ask_user_and_pause(db, node: Node, parsed: dict) -> None:
+    """处理 ask_user：把问题写进消息流，节点置 paused 等待用户回复。
+
+    用户在会话里回复(send_message)后，节点回到 running 重新执行，agent 拿到回答继续。
+    对齐 dsh ask_user —— 让 agent 在关键决策前能真正询问用户。
+    """
+    questions = parsed.get("questions") or []
+    if not questions:
+        return
+    # 组装问题文本：每个问题一行，带选项
+    lines = []
+    for i, q in enumerate(questions, 1):
+        qtxt = str(q.get("question", "")).strip()
+        if not qtxt:
+            continue
+        header = str(q.get("header", "")).strip()
+        prefix = f"【{header}】 " if header else "[提问] "
+        lines.append(f"{prefix}{qtxt}")
+        opts = q.get("options") or []
+        if opts:
+            for idx, o in enumerate(opts, 1):
+                lines.append(f"  {idx}. {o}")
+    if not lines:
+        return
+    question_text = "\n".join(lines)
+
+    # 追加到消息流（系统步骤消息，前端消息流可见）
+    msgs = list(node.messages or [])
+    msgs.append({"id": _gen_step_id(), "role": "system", "step": "用户提问", "detail": question_text[:800], "at": int(time.time() * 1000)})
+    node.messages = msgs
+    # 置为 paused，等待用户回复（send_message 会恢复到 running）
+    node.status = "paused"
+    db.commit()
+    await publish(
+        node.sessionId,
+        {
+            "type": "node_update",
+            "nodeId": node.nodeId,
+            "status": "paused",
+            "messages": node.messages,
+            "userQuestion": question_text[:800],
+        },
+    )
+
+
+
+async def _handle_todo_write(db, node: Node, parsed: dict) -> None:
+    """处理 todo_write：整份替换 node.plan.steps，持久化并推送前端。
+
+    对齐 dsh todo_write 语义：每次全量替换、status 三元（pending/in_progress/completed），
+    并做本地映射到已有 plan 结构（status 归一化为 running/done 以兼容前端 plan 渲染）。
+    """
+    todos = parsed.get("todos") or []
+    steps = []
+    for t in todos:
+        content = str(t.get("content", "")).strip()
+        if not content:
+            continue
+        raw_status = t.get("status", "pending")
+        # dsh 的 completed/in_progress/pending -> 本地 plan 的 done/running/pending
+        mapped = "done" if raw_status == "completed" else ("running" if raw_status == "in_progress" else "pending")
+        steps.append({"label": content, "status": mapped})
+    if not steps:
+        return
+    plan = dict(node.plan or {})
+    plan["steps"] = steps
+    node.plan = plan
+    if hasattr(node, "messages"):
+        node.messages = node.messages or []
+    db.commit()
+    await publish(
+        node.sessionId,
+        {
+            "type": "node_update",
+            "nodeId": node.nodeId,
+            "status": node.status,
+            "plan": node.plan,
+            "messages": node.messages,
+        },
+    )
+
+
+# 判定"复杂任务"的敏感词（含这些关键词的操作，计划需要先经用户审批）
+_PLAN_APPROVAL_SENSITIVE = (
+    "删除", "清空", "重置", "覆盖", "重写", "迁移", "重构", "安装", "卸载",
+    "git push", "git commit", "删除文件", "打包", "发布", "部署", "改数据库", "迁移数据",
+)
+
+
+def _task_needs_plan_approval(plan: dict | None, user_text: str) -> bool:
+    """复杂任务(true)才弹计划审批：步骤较多，或任务文本含敏感操作。"""
+    steps = ((plan or {}).get("steps") or []) if isinstance(plan, dict) else []
+    if len(steps) >= 3:
+        return True
+    low = (user_text or "").lower()
+    return any(k in low for k in _PLAN_APPROVAL_SENSITIVE)
+
+
+async def _maybe_plan_approval(db, node: Node, user_text: str, messages: list[dict], provider, provider_model: str) -> None:
+    """混合 plan-mode：默认高自主执行；复杂任务先弹计划审批，批准才继续，拒绝则要求重规划。"""
+    if not _task_needs_plan_approval(node.plan, user_text):
+        return
+    plan = node.plan or {}
+    steps_text = "\n".join(f"- {s.get('label', '')}" for s in (plan.get("steps") or []))
+    summary = f"任务计划（{len((plan.get('steps') or []))} 步）：\n{steps_text}"
+    # 通过现有审批机制弹计划审批
+    ap = await _request_approval(db, node, "plan", {"plan": summary[:2000]})
+    decision = await _wait_approval(db, ap.id)
+    if decision == "rejected":
+        # 用户拒绝计划：把该审批收尾为终态，注入引导消息让模型重新规划
+        await _settle_approval(db, ap.id)
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "用户对当前计划不满意并拒绝了。请重新审视任务，制定一个更合理、更贴合用户意图的执行计划，"
+                    "然后用 todo_write 更新计划步骤，再按新计划逐步执行。不要重复刚才不被认可的做法。"
+                ),
+            }
+        )
+        await publish(
+            node.sessionId,
+            {"type": "node_update", "nodeId": node.nodeId, "status": node.status,
+             "plan": node.plan, "messages": node.messages, "planRejected": True},
+        )
+    else:
+        await publish(
+            node.sessionId,
+            {"type": "node_update", "nodeId": node.nodeId, "status": node.status,
+             "plan": node.plan, "messages": node.messages, "planApproved": True},
+        )
+
+
+async def _settle_approval(db, approval_id: str) -> None:
+    """把审批收尾为终态（避免悬空 pending）。"""
+    try:
+        ap = db.get(Approval, approval_id)
+        if ap and ap.status == "pending":
+            ap.status = "rejected"
+            db.commit()
+    except Exception:
+        pass
+
+
+async def _publish_exec_event(db, node: Node) -> None:
+    """把节点最新执行事件推给前端（WS），实现执行轨迹的实时可视化。
+
+    前端收到 exec_event 后可增量渲染 agent 的 turn→step→工具→结果轨迹，
+    对齐 dsh session event log 的实时反馈。
+    """
+    try:
+        from . import event_log
+        events = event_log.EventLog(node.sessionId, node.nodeId).latest_run_events()
+        if not events:
+            return
+        last = events[-1]
+        await publish(
+            node.sessionId,
+            {
+                "type": "exec_event",
+                "nodeId": node.nodeId,
+                "event": last,
+                "traceCount": len(events),
+            },
+        )
+    except Exception:
+        pass
+
+
 async def _run_real(node_id: str) -> None:
     """用真实模型流式执行一个节点：逐步写入 messages/progress，完成后 done + 发布上下文。"""
     db = SessionLocal()
@@ -442,6 +642,12 @@ async def _run_real(node_id: str) -> None:
             return
         sess = db.get(Session, node.sessionId)
         workspace = (sess.workspace if sess and sess.workspace else None) or os.getcwd()
+
+        # 本次执行的事件日志（借鉴 dsh durable session log）：追加写，turn_start 开启新 run。
+        # 供回放、审计、retry 恢复（上一轮事件被后续 re-run 覆盖，turn_start 自增 run 区分）。
+        _elog = EventLog(node.sessionId, node.nodeId)
+        _prior_events = _elog.read_all()
+        _elog.turn_start(node.title or "", node.inputText or "")
 
         # 父节点产出作为上下文：读取每个父节点的「内容块」历史（按时间追加，块级摘要索引）
         parent_outputs = []
@@ -473,12 +679,14 @@ async def _run_real(node_id: str) -> None:
         cfg_base = provider.baseUrl.rstrip("/")
         provider_model = (node.__dict__.get("model") or None) or ((provider.models or [])[0] if provider.models else "default")
 
-        # 上下文实时压缩：长对话时把更早历史折叠成摘要，避免滚动截断丢信息
+        # 上下文实时压缩（token 压力驱动，对齐 dsh compaction）：长对话超预算时
+        # 把更早历史折叠成 <compacted-summary> 摘要，保留最近 tail。
         try:
             from .executor import compact_history
             history = await compact_history(
                 cfg_base, provider.pick_api_key(), provider_model, history,
                 keep_recent=6, max_old_chars=6000,
+                budget_tokens=24000,  # 历史部分 token 预算（其余留给系统提示/工具/当前轮）
             )
         except Exception:
             pass  # 压缩失败不影响主流程
@@ -498,6 +706,52 @@ async def _run_real(node_id: str) -> None:
             project_context = ""
 
         messages = build_messages(node.title, user_text, history, parent_outputs, node.memory, skills_text, project_context)
+
+        # 若为重试/继续（存在上一轮事件日志且非空），从上一轮事件重建"前情摘要"，
+        # 注入上下文，让 agent 基于上次进展和失败点继续，而不是盲目重来。
+        # 从事件日志重建最近一次 run 的 LLM 消息（原文 + 工具结果），供模型看到上次实际做过什么。
+        try:
+            prior_runs = _elog.runs()
+            if len(prior_runs) >= 2 and _prior_events:
+                # runs() 给出每次执行的 (run, start_seq, status)；取上一条已结束 run 的事件
+                prev_run = prior_runs[-2]
+                if prev_run and prev_run[0] > 0:
+                    prev_events = [e for e in _prior_events if e.get("run", 0) == prev_run[0]]
+                    prev_status = prev_run[2] or "unknown"
+                    if prev_events:
+                        rebuild = []
+                        try:
+                            from .event_log import rebuild_context as _rebuild
+                            rebuild = _rebuild(prev_events, keep_recent_steps=6, compress=False)
+                        except Exception:
+                            rebuild = []
+                        prev_text = "\n".join(
+                            str(m.get("text") or m.get("content") or "")
+                            for m in rebuild[-8:]
+                            if m.get("text") or m.get("content")
+                        )[:2500]
+                        # 去掉头部 system/用户任务重复，聚焦上次执行情况
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"【上一次执行（状态：{prev_status}）的进展与动作，供继续参考，不要重复已完成部分】\n"
+                                    f"{prev_text or '（无有效可参考内容）'}"
+                                ),
+                            }
+                        )
+        except Exception:
+            pass  # 事件日志恢复失败不影响主流程
+
+        # 动态上下文注入（对齐 dsh runtime context）：当前时间/工作目录/git 状态/平台
+        try:
+            from .context import dynamic_context
+            dyn = dynamic_context(workspace)
+            if dyn.strip():
+                messages.append({"role": "system", "content": f"【运行时上下文】\n{dyn}"})
+        except Exception:
+            pass
+
         tools = openai_tools()
         # 合并已启用的 MCP server 工具（第三方工具生态）
         mcp_tools_by_name: dict[str, str] = {}  # 工具名 -> server 名
@@ -538,6 +792,7 @@ async def _run_real(node_id: str) -> None:
                 "messages": node.messages,
             },
         )
+        await _maybe_plan_approval(db, node, user_text, messages, provider, provider_model)
 
         # 确保存在一条 assistant 占位
         msgs = list(node.messages or [])
@@ -703,7 +958,12 @@ async def _run_real(node_id: str) -> None:
             )
 
         async def push_reflection(tool_name: str, result: str):
-            """工具失败后注入反思提示，让模型换策略重试（不超过 2 次）。"""
+            """工具失败后注入反思提示，让模型换策略重试（同一工具累计不超过 2 次）。
+
+            超过阈值时不再死磕：引导模型评估「是否值得继续 / 是否可回滚已做改动」，
+            若不宜继续则停止该路线，并把不确定部分明确标为「待确认」，回到主流程推进。
+            对齐 dsh 的"对不确定处明确标注 / 自我验证"行为。
+            """
             fail_counts[tool_name] = fail_counts.get(tool_name, 0) + 1
             if fail_counts[tool_name] <= 2:
                 messages.append(
@@ -711,11 +971,27 @@ async def _run_real(node_id: str) -> None:
                         "role": "user",
                         "content": (
                             f"工具 {tool_name} 的执行结果：{result[:500]}\n\n"
-                            "请反思失败原因，换一种方法重试（不要重复完全相同调用）。"
+                            "【失败反思】请先分析失败原因（可能是参数错误、路径不存在、权限、外部依赖、思路本身不对等），"
+                            "然后换一种【不同的】方法重试——不要重复完全相同的调用。若换了策略仍失败，"
+                            "下一轮就停止该路线的纠缠，转入收尾。"
                         ),
                     }
                 )
                 await flush_step("反思重试", tool_name)
+            else:
+                # 该工具已持续失败：引导模型评估回滚/待确认，回到主流程
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"工具 {tool_name} 仍无法成功（已多次尝试）。请停止在这一点上继续纠缠：\n"
+                            "1) 评估刚才失败的改动是否已对工作区造成副作用；若有必要，评估是否回滚/清理已做的改动；\n"
+                            "2) 把无法完成或不确定的部分**明确标为「待确认」**，说明卡点和已知信息；\n"
+                            "3) 基于已完成的部分，继续推进剩余任务或给出结论，不要无限重试同一个失败点。"
+                        ),
+                    }
+                )
+                await flush_step("放弃该路线", tool_name)
         for _round in range(max_rounds):
             if cancelled():
                 break
@@ -723,10 +999,13 @@ async def _run_real(node_id: str) -> None:
             cur_step = plan_index()
             if cur_step >= 0:
                 await set_plan_step(cur_step, "running")
+            # 事件日志：本轮开始
+            _elog.step_start(_round)
 
             round_text = ""
             tool_calls: list[dict] = []
             last_reasoning = ""
+            deferred_reflections: list[tuple[str, str]] = []
             async for ev in stream_chat_with_tools(cfg_base, provider.pick_api_key(), provider_model, messages, tools, temperature=0.2):
                 if cancelled():
                     break
@@ -742,6 +1021,9 @@ async def _run_real(node_id: str) -> None:
 
             if cancelled():
                 break
+            # 事件日志：本轮模型产出（文本 + 工具调用 + token）
+            _elog.llm_done(round_text, last_reasoning, tool_calls)
+            await _publish_exec_event(db, node)
             # 本轮完成（产生工具或文本）→ 当前计划步骤 done
             if cur_step >= 0:
                 await set_plan_step(cur_step, "done")
@@ -754,6 +1036,79 @@ async def _run_real(node_id: str) -> None:
                 if last_reasoning:
                     assistant_tool_msg["reasoning_content"] = last_reasoning
                 messages.append(assistant_tool_msg)
+
+                # ---- 并行执行：把本轮"可并行安全"的独立工具先并发跑，最后统一收集 ----
+                # 判定：只读/独立、无审批、非状态类（读写文件/子代理/审批/MCP/特殊工具不并行）
+                _PARALLEL_SAFE = {
+                    "read", "read_file", "list_dir", "search_files", "grep_content",
+                    "web_search", "web_fetch", "memory_search", "read_parent_output",
+                    "search_parent_memory", "skill", "get_goal", "remember",
+                }
+                _parallel_results: dict[str, str] = {}
+                _subagent_tasks: dict[str, dict] = {}  # tool_call_id -> parsed(run_subagent)
+                _batch: list[tuple[str, str, dict]] = []  # (tool_call_id, name, parsed)
+                _subagent_run_ids: list[str] = []  # 本轮需要并行执行的 run_subagent 的 tool_call_id
+                for tc in tool_calls:
+                    _fn = tc.get("function", {})
+                    _n = _fn.get("name", "")
+                    _raw = _fn.get("arguments") or "{}"
+                    try:
+                        _parsed = _json.loads(_raw)
+                    except Exception:
+                        _parsed = {}
+                    if _n == "run_subagent":
+                        # 多个独立子任务：父节点(主agent)等待、子代理之间并行（父与子不同时执行其他任务）
+                        _subagent_run_ids.append(tc.get("id", ""))
+                        _subagent_tasks.setdefault(tc.get("id", ""), _parsed)
+                        continue
+                    if _n not in _PARALLEL_SAFE:
+                        continue
+                    # 只并行真正不需要审批的（当前这些只读工具恒不审批）
+                    if needs_approval(_n, _parsed):
+                        continue
+                    _batch.append((tc.get("id", ""), _n, _parsed))
+                # 子代理并行：同轮多个 run_subagent 用独立 DB session 并发执行（父等待全部完成后收集）
+                if _subagent_run_ids:
+                    await flush_step("并行子代理", f"{len(_subagent_run_ids)} 个独立子任务")
+                    from .db import SessionLocal as _SubSessionLocal
+
+                    async def _run_subparallel(tid: str):
+                        _sp = _subagent_tasks.get(tid, {})
+                        _sdb = _SubSessionLocal()
+                        try:
+                            _r = await _run_subagent(
+                                _sdb, node, provider, provider_model, workspace,
+                                _sp.get("task", ""), tool_ctx, int(_sp.get("max_rounds") or 4),
+                            )
+                            return tid, _r
+                        except Exception as _e:  # noqa: BLE001
+                            return tid, f"子代理执行出错：{_e}"
+                        finally:
+                            _sdb.close()
+
+                    _sub_results = await asyncio.gather(*[_run_subparallel(t) for t in _subagent_run_ids])
+                    for _tid, _tres in _sub_results:
+                        _parallel_results[_tid] = _tres
+                        _elog.tool_call("run_subagent", {}, False)
+                        _elog.tool_result("run_subagent", not is_failure(_tres), (_tres or "")[:2000], 0)
+                    await flush_step("子代理结果", f"收集 {len(_sub_results)} 个子任务结果")
+                    await _publish_exec_event(db, node)
+                if _batch:
+                    await flush_step("并行执行", f"{len(_batch)} 个独立工具")
+                    async def _run_one(item):
+                        _id, _n, _p = item
+                        try:
+                            return _id, _n, await execute(_n, _p, workspace, tool_ctx)
+                        except Exception as _e:
+                            return _id, _n, f"工具执行出错：{_e}"
+                    _par_results = await asyncio.gather(*[_run_one(t) for t in _batch])
+                    for _tid, _tn, _tres in _par_results:
+                        _parallel_results[_tid] = _tres
+                        _elog.tool_call(_tn, {}, False)
+                        _elog.tool_result(_tn, not is_failure(_tres), (_tres or "")[:2000], 0)
+                    await flush_step("并行结果", f"收集 {len(_par_results)} 个结果")
+                    await _publish_exec_event(db, node)
+
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
@@ -763,6 +1118,79 @@ async def _run_real(node_id: str) -> None:
                         parsed = _json.loads(raw_args)
                     except Exception:
                         parsed = {}
+                    if name == "todo_write":
+                        # 待办清单：整份替换，映射到 node.plan.steps 持久化并推送前端（对齐 dsh todo_write）
+                        await _handle_todo_write(db, node, parsed)
+                        result = "待办清单已更新。"
+                        messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": f"待办清单已更新：{_todo_summary(parsed)}"})
+                        continue
+                    if tc.get("id", "") in _parallel_results:
+                        # 该工具已在并行批次执行，直接使用已收集的结果
+                        _pres = _parallel_results.get(tc.get("id", ""), "")
+                        messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": _pres})
+                        if is_failure(_pres):
+                            deferred_reflections.append((name, _pres))
+                        continue
+                    if name == "create_goal":
+                        # 设置长期目标（对齐 dsh goal）：存进 node.memory.goal，agent 后续轮次持续记住
+                        objective = str(parsed.get("objective", "")).strip()
+                        if objective:
+                            mem = dict(node.memory or {})
+                            mem["goal"] = objective
+                            mem["goal_round"] = 0  # goal 自动延续：从第 0 轮开始
+                            if not mem.get("goal_max_rounds"):
+                                mem["goal_max_rounds"] = 4  # 默认最多推进 4 轮
+                            node.memory = mem
+                            node.messages = node.messages or []
+                            db.commit()
+                            await publish(node.sessionId, {"type": "node_update", "nodeId": node.nodeId,
+                                                            "status": node.status, "memory": node.memory, "messages": node.messages})
+                        messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                         "content": f"已设定持续目标：{objective[:120]}"})
+                        continue
+                    if name == "get_goal":
+                        g = (node.memory or {}).get("goal") if node.memory else None
+                        result = f"当前持续目标：{g}" if g else "当前没有设定持续目标。"
+                        messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
+                        continue
+                    if name == "schedule_create":
+                        # 创建定时提醒：存到 node.memory.schedules，到点由 tick 注入为新的用户消息触发下一轮
+                        prompt = str(parsed.get("prompt", "")).strip()
+                        after = int((parsed.get("after_seconds") or 0) or 0)
+                        every = int((parsed.get("every_seconds") or 0) or 0)
+                        if not prompt:
+                            messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": "schedule_create 需要非空 prompt"})
+                            continue
+                        if after <= 0 and every <= 0:
+                            messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": "schedule_create 需要 after_seconds 或 every_seconds"})
+                            continue
+                        import uuid as _uu
+                        sid = "sched-" + _uu.uuid4().hex[:8]
+                        now = time.time()
+                        every = every if every >= 300 else 0  # 周期最少 300s
+                        mem = dict(node.memory or {})
+                        sched = list(mem.get("schedules") or [])
+                        sched.append({
+                            "id": sid,
+                            "prompt": prompt[:500],
+                            "due_ts": now + (after or every),
+                            "every": every,
+                            "last_ts": None,
+                        })
+                        mem["schedules"] = sched
+                        node.memory = mem
+                        node.messages = node.messages or []
+                        db.commit()
+                        await publish(node.sessionId, {"type": "node_update", "nodeId": node.nodeId,
+                                                        "status": node.status, "memory": node.memory, "messages": node.messages})
+                        messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                         "content": f"已创建定时提醒 {sid}（after={after}s, every={every}s）：{prompt[:80]}"})
+                        continue
+                    if name == "ask_user":
+                        # 向用户提问（对齐 dsh ask_user）：把问题写进消息流，节点置 paused 等待用户回复；
+                        # 用户在会话里回复(send_message)后节点回到 running 继续执行。
+                        await _ask_user_and_pause(db, node, parsed)
+                        return
                     if name == "run_subagent":
                         await flush_step("子代理", parsed.get("task", "")[:80])
                         try:
@@ -790,6 +1218,8 @@ async def _run_real(node_id: str) -> None:
                             messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
                             continue
                     tool_def = TOOL_BY_NAME.get(name)
+                    # 事件日志：工具调用（含是否需审批）
+                    _elog.tool_call(name, parsed, bool(tool_def and needs_approval(name, parsed)))
                     if tool_def and needs_approval(name, parsed):
                         await flush_step("待审批", f"{name} {raw_args[:80]}")
                         ap = await _request_approval(db, node, name, parsed)
@@ -811,9 +1241,14 @@ async def _run_real(node_id: str) -> None:
                         except Exception as e:  # noqa: BLE001
                             result = f"工具执行出错：{e}"
                         await flush_step("工具结果", (result or "")[:120])
+                    # 事件日志：工具结果
+                    _elog.tool_result(name, not is_failure(result), (result or "")[:2000], 0)
+                    await _publish_exec_event(db, node)
                     messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
                     if is_failure(result):
-                        await push_reflection(name, result)
+                        # 先收集反思，不在 tool_calls 中间插入 user 消息，
+                        # 等本轮所有 tool 结果都 append 到位后再统一注入（否则 deepseek 400）
+                        deferred_reflections.append((name, result))
                 # 兜底：确保每个 tool_call_id 都有对应 tool 消息（缺了补空结果），
                 # 避免 deepseek 报「insufficient tool messages following tool_calls」
                 tc_ids = {tc.get("id", "") for tc in tool_calls if tc.get("id")}
@@ -824,6 +1259,11 @@ async def _run_real(node_id: str) -> None:
                 }
                 for missing in tc_ids - existing_ids:
                     messages.append({"role": "tool", "tool_call_id": missing, "content": "（该工具未返回结果）"})
+                # 本轮所有 tool 消息已就位，此时再注入反思 user 消息，不破坏 tool_calls→tool 的相邻顺序
+                for rname, rresult in deferred_reflections:
+                    # 事件日志：失败反思
+                    _elog.reflection(rname, (rresult or "")[:500])
+                    await push_reflection(rname, rresult)
                 continue  # 继续下一轮
             else:
                 # 本轮没有工具调用：保留已有 acc（可能是空，说明模型直接给文本或结束）
@@ -834,6 +1274,7 @@ async def _run_real(node_id: str) -> None:
 
         if cancelled() or node_id in _cancel_requested or (db.get(Node, node_id) or node).status == "cancelled":
             _cancel_requested.discard(node_id)
+            print(f"[cancel] 执行循环检测到取消，节点 {node_id} 正在收尾", flush=True)
             cur = db.get(Node, node_id)
             if cur:
                 cur.status = "cancelled"
@@ -846,6 +1287,8 @@ async def _run_real(node_id: str) -> None:
                         break
                 cur.messages = msgs
                 db.commit()
+                # 事件日志：turn 结束（取消）
+                _elog.turn_end("cancelled", "", None)
                 await publish(
                     node.sessionId,
                     {
@@ -896,6 +1339,28 @@ async def _run_real(node_id: str) -> None:
             sess.usage = usage
             sess.updatedAt = _now_dt()
 
+        # ---- goal 自动延续（对齐 dsh goal-round-driver）：目标未完成则自动进入下一轮 ----
+        _mem = dict(node.memory or {})
+        _goal = _mem.get("goal")
+        if _goal and not _goal_done_marked(final_text) and not cancelled():
+            _round = int(_mem.get("goal_round") or 0) + 1
+            _max = int(_mem.get("goal_max_rounds") or 4)
+            if _round <= _max:
+                # 新一轮继续推进；保留目标字段，避免 _rolling_memory 覆盖
+                _mem["goal"] = _goal
+                _mem["goal_round"] = _round
+                node.memory = _mem
+                msgs = list(node.messages or [])
+                msgs.append({"id": _gen_step_id(), "role": "user",
+                             "text": f"[目标延续 第{_round}轮] 目标尚未达成。请基于本轮进展继续推进目标「{str(_goal)[:120]}」，不要重复已完成部分；若本轮彻底达成目标，请以 [GOAL_DONE] 结束。"})
+                node.messages = msgs
+                node.status = "running"
+                db.commit()
+                await publish(node.sessionId, {"type": "node_update", "nodeId": node.nodeId,
+                                               "status": "running", "memory": node.memory, "messages": node.messages, "goalContinuation": _round})
+                _real_exec_tasks.pop(node_id, None)
+                return
+
         node.status = "done"
         node.output = {
             "type": "text",
@@ -905,6 +1370,8 @@ async def _run_real(node_id: str) -> None:
         }
         await publish_output_to_context(db, node)
         db.commit()
+        # 事件日志：turn 结束（成功）
+        _elog.turn_end("done", final_text, None)
         await publish(
             node.sessionId,
             {
@@ -924,6 +1391,8 @@ async def _run_real(node_id: str) -> None:
             node.status = "failed"
             node.failedReason = f"执行失败：{e}"
             db.commit()
+            # 事件日志：turn 结束（失败）
+            _elog.turn_end("failed", "", None)
             await publish(
                 node.sessionId,
                 {"type": "node_update", "nodeId": node_id, "status": "failed",
@@ -942,14 +1411,28 @@ async def _run_subagent(
     from .executor import stream_chat_with_tools
 
     sys = (
-        "你是主 agent 的聚焦子代理，负责一个明确的子任务。遵循「先探测、后行动」，"
-        "分步执行、失败换策略，最终用中文返回一个精炼结论（含关键过程与文件/工具）。"
-        "不要调用 run_subagent（禁止嵌套）。"
+        "你是主 agent 派出的聚焦子代理，负责一个完全独立的子任务。你不共享主 agent 的对话，"
+        "任务说明里已包含你需要的全部上下文。遵循「先探测、后行动」：\n"
+        "1) 先用工具核实事实（read/search/web_search 等），再下结论或动手；不确定不要臆造。\n"
+        "2) 复杂任务分步执行、失败分析原因换策略，不要盲目重复同一操作。\n"
+        "3) 需要信息用只读工具，写文件/执行命令是敏感操作会请求审批。\n"
+        "4) 不要调用 run_subagent（禁止嵌套子代理）。\n"
+        "5) 完成时用中文返回一个【精炼结论】：先说结论，再给关键过程（含用到的文件/工具），"
+        "不要输出中间思考的每一步——主 agent 只需要你的最终结果。"
     )
     messages = [
         {"role": "system", "content": sys},
-        {"role": "user", "content": f"子任务：{task}\n工作目录：{workspace}"},
+        {"role": "system", "content": f"工作目录：{workspace}"},
+        {"role": "user", "content": f"子任务：{task}"},
     ]
+    # 动态上下文（时间/git 状态等）
+    try:
+        from .context import dynamic_context
+        dyn = dynamic_context(workspace)
+        if dyn.strip():
+            messages.append({"role": "system", "content": f"【运行时上下文】\n{dyn}"})
+    except Exception:
+        pass
     tools = openai_tools()
     acc = ""
     for _ in range(max(1, min(max_rounds, 6))):
@@ -1010,6 +1493,17 @@ async def tick() -> None:
         # ready -> running（并发上限）
         for n in nodes:
             if n.status == "ready" and running_count < CONCURRENCY:
+                # 父子互斥：若父链或子链上有正在运行的节点，则暂不启动（保持 ready 等待）
+                try:
+                    status_of = {x.nodeId: x.status for x in nodes}
+                    parents_of = {x.nodeId: set(x.parentIds or []) for x in nodes}
+                    recur = running_relatives({n.nodeId}, status_of, parents_of)
+                except Exception:
+                    recur = []
+                # 注意：n 自身还没 running；这里需要把"此刻已在 running 的亲人"去掉自身干扰
+                if recur:
+                    # 有父/子在跑 → 不调度，等其完成
+                    continue
                 n.status = "running"
                 # 记录节点读上下文基线：启动时每个 key 的版本快照（§4.2.1 读模型）
                 n.baseContext = {
@@ -1093,6 +1587,38 @@ async def tick() -> None:
                 if sts and all(is_terminal(s) for s in sts):
                     n.status = "ready" if all(s == "done" for s in sts) else "blocked"
                     changed_ids.add(n.nodeId)
+
+        # ---- 定时提醒（schedule）触发：到期注入新的用户消息，触发下一个执行轮 ----
+        now_ts = time.time()
+        for n in nodes:
+            mem = n.memory or {}
+            scheds = mem.get("schedules") or []
+            if not scheds:
+                continue
+            pending = [s for s in scheds if (s.get("due_ts") or now_ts + 1) <= now_ts]
+            if not pending:
+                continue
+            # 触发：把每个到期提醒的 prompt 作为新的 user 消息注入
+            msgs = list(n.messages or [])
+            newly_running = False
+            for s in pending:
+                pmt = str(s.get("prompt", "")).strip() or "定时任务触发"
+                msgs.append({"id": _gen_step_id(), "role": "user", "text": f"[定时提醒] {pmt}", "at": int(now_ts * 1000)})
+                # 周期任务重置下一轮；一次性任务移除
+                if s.get("every") and s["every"] >= 300:
+                    s["due_ts"] = now_ts + s["every"]
+                    s["last_ts"] = now_ts
+                else:
+                    scheds.remove(s)
+            n.messages = msgs
+            n.memory = mem
+            # 若非执行中，置 running 让它执行这一轮
+            if n.status not in ("running", "paused"):
+                n.status = "running"
+                newly_running = True
+            if newly_running and n.nodeId not in _real_exec_tasks and _model_configured(db):
+                real_dispatch.append(n.nodeId)
+            changed_ids.add(n.nodeId)
 
         if changed_ids:
             db.commit()

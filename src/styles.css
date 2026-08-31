@@ -1036,7 +1036,7 @@ body {
   padding: 6px 10px;
   border-radius: 10px;
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.42;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -1057,17 +1057,27 @@ body {
   width: 100%;
   box-sizing: border-box;
 }
+.chat-assistant .chat-bubble {
+  position: relative; /* 一键复制按钮绝对定位在右下角 */
+  padding-bottom: 18px; /* 为右下角按钮留空间 */
+}
 .copy-btn {
   border: none;
   background: transparent;
   color: #94a3b8;
   cursor: pointer;
   font-size: 11px;
-  padding: 0 2px;
+  padding: 0 6px;
   opacity: 0;
   transition: opacity 0.15s;
 }
-.chat-bubble-wrap:hover .copy-btn {
+.chat-assistant .chat-bubble > .copy-btn {
+  position: absolute;
+  right: 4px;
+  bottom: 2px;
+}
+.chat-bubble-wrap:hover .copy-btn,
+.chat-assistant .chat-bubble:hover .copy-btn {
   opacity: 1;
 }
 .copy-btn:hover {
@@ -1921,19 +1931,23 @@ body {
   box-shadow: none;
 }
 .root-pill {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  height: 100%;
-  color: #64748b;
-  font-size: 13px;
+  display: none; /* 根节点已改为纯圆点 */
 }
 .root-dot {
-  width: 10px;
-  height: 10px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: #94a3b8;
+  background: #9ca3af; /* 根节点灰色 */
+  box-shadow: 0 0 0 3px rgba(156, 163, 175, 0.25);
+  cursor: pointer;
+  display: block;
+}
+.root-dot.is-anchor {
+  background: #6b7280;
+  box-shadow: 0 0 0 3px rgba(107, 114, 128, 0.3);
+}
+.root-dot.is-selected {
+  box-shadow: 0 0 0 4px rgba(156, 163, 175, 0.4);
 }
 .root-anchor-hint {
   font-size: 10px;
@@ -2055,4 +2069,289 @@ body {
 .card-approval-actions .btn {
   padding: 4px 10px;
   font-size: 12px;
+}
+
+/* ---- markdown 层级结构（对齐 dsh 回复渲染） ---- */
+.markdown-body { line-height: 1.42; word-break: break-word; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  font-weight: 600; line-height: 1.2; margin: 0.35em 0 0.15em;
+}
+.markdown-body h1 { font-size: 1.18em; }
+.markdown-body h2 { font-size: 1.1em; }
+.markdown-body h3 { font-size: 1.03em; }
+.markdown-body p { margin: 0.2em 0; }
+.markdown-body ul, .markdown-body ol { margin: 0.15em 0; padding-left: 1.3em; }
+.markdown-body li { margin: 0.04em 0; }
+.markdown-body code { background: rgba(127,127,127,0.15); border-radius: 3px; padding: 0 3px; font-size: 0.9em; }
+.markdown-body pre {
+  background: rgba(0,0,0,0.05); border-radius: 6px; padding: 6px 9px; overflow-x: auto;
+  font-size: 0.88em; line-height: 1.4; margin: 0.3em 0;
+}
+.markdown-body pre code { background: transparent; padding: 0; }
+.markdown-body a { color: #2563eb; text-decoration: none; }
+.markdown-body blockquote {
+  margin: 0.3em 0; padding-left: 0.8em; border-left: 3px solid rgba(127,127,127,0.4); color: #555;
+}
+.markdown-body table { border-collapse: collapse; margin: 0.3em 0; font-size: 0.92em; }
+.markdown-body th, .markdown-body td { border: 1px solid rgba(127,127,127,0.35); padding: 4px 8px; }
+.markdown-body th { background: rgba(127,127,127,0.12); }
+
+/* 同一轮的 assistant 回复合并框内多条分隔 */
+.assistant-reply + .assistant-reply {
+  border-top: 1px dashed rgba(127,127,127,0.25);
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+/* 任务进度栏（计划）：放在对话栏上方，下边界紧贴对话栏上边界 */
+.card-body-expanded .exec-card {
+  margin: 4px 0 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.card-body-expanded .exec-card + .chat-flow {
+  border-top: 1px solid #e2e8f0;
+}
+
+/* 任务进度栏融入输入栏：样式与输入栏一致 */
+.chat-input-box .exec-card {
+  border: none;
+  border-bottom: 1px solid #eef2f7;
+  border-radius: 0;
+  background: transparent;
+  margin: 0;
+}
+.chat-input-box .exec-card .exec-head {
+  padding: 6px 10px;
+}
+.chat-input-box .exec-card .exec-body {
+  padding: 2px 10px 6px;
+}
+
+/* ---- 审核信任级选择器 ---- */
+.trust-picker { position: relative; margin: 8px 2px 4px; display: inline-block; }
+.trust-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; color: #374151; background: rgba(127,127,127,0.08);
+  border: 1px solid rgba(127,127,127,0.2); border-radius: 6px; padding: 3px 8px;
+  cursor: pointer;
+}
+.trust-btn:hover { background: rgba(127,127,127,0.16); }
+.trust-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.trust-dot[data-level='all'] { background: #16a34a; }
+.trust-dot[data-level='partial'] { background: #f59e0b; }
+.trust-dot[data-level='none'] { background: #dc2626; }
+.trust-chevron { font-size: 10px; color: #9ca3af; }
+.trust-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
+  min-width: 240px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.1); padding: 4px; display: flex; flex-direction: column;
+}
+.trust-opt {
+  display: flex; align-items: center; gap: 8px; text-align: left;
+  font-size: 12px; color: #111827; background: none; border: none; border-radius: 6px;
+  padding: 6px 8px; cursor: pointer;
+}
+.trust-opt:hover { background: rgba(127,127,127,0.08); }
+.trust-opt.is-active { background: rgba(37,99,235,0.1); }
+.trust-opt-label { font-weight: 600; white-space: nowrap; }
+.trust-opt-tip { color: #6b7280; }
+
+/* trust 选择器放进输入框 toolbar（模型选择右侧） */
+.chat-input-toolbar .trust-picker {
+  margin: 0;
+}
+.chat-input-toolbar .trust-btn {
+  height: 32px;
+  box-sizing: border-box;
+}
+.chat-input-toolbar .trust-menu {
+  top: calc(100% + 2px);
+}
+
+/* ---- 消息支持鼠标选择复制（卡片整体 user-select:none，但聊天区允许选择） ---- */
+.dag-node .chat-flow,
+.dag-node .chat-bubble,
+.dag-node .markdown-body,
+.dag-node .assistant-reply,
+.dag-node .chat-bubble * {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+/* 聊天区不做指针拦截，可正常选中文本 */
+.dag-node .chat-flow {
+  cursor: text;
+}
+
+/* ---- 信任菜单：Portal 到 body + fixed 定位，确保在最上层不被卡片/画布遮挡 ---- */
+.trust-menu-fixed {
+  position: fixed !important;
+  top: 0;
+  left: 0;
+  z-index: 9999 !important;
+  min-width: 250px;
+}
+.trust-opt-col {
+  display: flex;
+  flex-direction: column;
+}
+
+
+/* ---- 整个页面都支持鼠标选择复制：计划栏、执行过程栏、消息等区都放开选择 ---- */
+/* 卡片本体默认 user-select:none（防拖拽误选），但所有"内容展示区"可选中复制 */
+.dag-node .exec-card,
+.dag-node .exec-goal,
+.dag-node .exec-step-count,
+.dag-node .exec-body,
+.dag-node .exec-item,
+.dag-node .exec-item-label,
+.dag-node .exec-item-detail,
+.dag-node .exec-fold .exec-fold-body,
+.dag-node .exec-fold-body .agent-step,
+.dag-node .agent-step-label,
+.dag-node .agent-step-detail,
+.dag-node .fail-reason,
+.dag-node .parent-context-card,
+.dag-node .parent-context-body,
+.dag-node .chat-flow,
+.dag-node .chat-bubble,
+.dag-node .markdown-body,
+.dag-node .assistant-reply,
+.dag-node .trust-picker {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+/* 用户消息气泡：一键复制按钮放在消息框下方靠右 */
+.chat-user .chat-bubble-wrap {
+  flex-direction: column !important;
+  align-items: flex-end !important;
+  gap: 2px;
+}
+.chat-user .chat-bubble-wrap .copy-btn {
+  flex: none;
+  margin-right: 6px;
+}
+.chat-user .chat-bubble-wrap:hover .copy-btn,
+.chat-user .chat-bubble:hover ~ .copy-btn {
+  opacity: 1;
+}
+
+/* ---- 执行轨迹（event_log 细粒度时间线） ---- */
+.tl { border: 1px solid #e5e7eb; border-radius: 8px; margin: 6px 2px; font-size: 11px; background: #fafafa; }
+.tl-summary, .tl-head { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; color: #374151; }
+.tl-head { font-weight: 600; user-select: none; }
+.tl-head::-webkit-details-marker { display: none; }
+.tl-count { margin-left: auto; color: #9ca3af; font-weight: 400; }
+.tl-chevron { font-size: 10px; color: #9ca3af; }
+.tl-body { max-height: 200px; overflow-y: auto; border-top: 1px solid #f0f0f0; padding: 4px 8px; }
+.tl-row { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; user-select: text; }
+.tl-time { color: #b0b7c2; font-size: 10px; min-width: 40px; flex: none; }
+.tl-content { flex: 1; color: #4b5563; }
+.tl-turn { color: #2563eb; font-weight: 600; }
+.tl-step { color: #7c3aed; }
+.tl-call { color: #0f766e; }
+.tl-result.ok { color: #16a34a; }
+.tl-result.bad { color: #dc2626; }
+.tl-llm { color: #64748b; }
+.tl-end { color: #6b7280; font-weight: 600; }
+
+/* ---- 执行过程 & 任务栏：样式对齐 ExecTimeline（紧凑时间线 + 彩色圆点状态） ---- */
+/* 执行过程折叠块：更像明细时间线 */
+.exec-fold {
+  border-radius: 8px;
+  background: #fafafa;
+  border-color: #e5e7eb;
+}
+.exec-fold-body {
+  padding: 4px 8px;
+  gap: 2px;
+  font-size: 11px;
+  max-height: 220px;
+}
+.exec-fold-body .agent-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0;
+  user-select: text;
+}
+.exec-fold-body .agent-step .input-icon {
+  flex: none;
+  width: 10px;
+  text-align: center;
+}
+.exec-fold-body .agent-step-label {
+  color: #4b5563;
+}
+.exec-fold-body .agent-step-detail {
+  color: #b0b7c2;
+  font-size: 10px;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
+}
+
+/* 任务栏（计划步数 ExecutionCard）：对齐 ExecTimeline 行样式 */
+.exec-body {
+  padding: 4px 8px;
+  gap: 2px;
+}
+.exec-item {
+  align-items: baseline;
+  font-size: 11px;
+  color: #4b5563;
+  padding: 1px 0;
+}
+.exec-item-icon {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+}
+
+/* 折叠头统一紧凑 */
+.exec-fold-head, .exec-head {
+  font-size: 11px;
+  color: #374151;
+}
+
+/* 执行轨迹与下方大模型回复气泡共用一个边界 */
+.chat-group .tl {
+  margin: 0 0 0;
+  border-radius: 8px 8px 0 0;
+  border-bottom: none;
+}
+.chat-group .tl + .chat-assistant .chat-bubble {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  box-shadow: 0 -1px 0 0 #e5e7eb inset; /* 共用一个上边界线 */
+}
+
+/* 执行中：回复气泡内的实时步骤预览 */
+.exec-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #7c3aed;
+  font-size: 12px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  user-select: text;
+}
+.exec-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #7c3aed;
+  animation: exec-live-pulse 1.2s ease-in-out infinite;
+}
+@keyframes exec-live-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
 }

@@ -10,6 +10,14 @@ class ModelNotConfigured(Exception):
     pass
 
 
+class _RetryableHTTP(Exception):
+    """限流(429)/5xx 等可重试的 HTTP 状态（流式请求建立阶段）。"""
+
+    def __init__(self, status: int):
+        super().__init__(f"retryable llm http status {status}")
+        self.status = status
+
+
 def load_config(db) -> tuple[str, str, str]:
     """返回 (base_url, api_key, model)；未配置抛 ModelNotConfigured。"""
     cfg = db.get(ModelConfig, "default") if hasattr(db, "get") else None
@@ -29,35 +37,58 @@ def build_messages(
     skills_text: str = "",
     project_context: str = "",
 ) -> list[dict]:
-    """组装发给模型的消息：系统提示 + 项目上下文 + 卡片滚动记忆 + 父节点产出 + 历史 + 当前输入。"""
-    system = (
-        "你是本卡片的专属执行 agent。遵循「先探测、后行动」的工作模式：\n"
-        "【工作原则】\n"
-        "1) 先用工具核实事实（列目录/读文件/检索），再下结论或动手；不确定时不要臆造，用工具确认。\n"
-        "2) 需要信息时优先用只读工具（list_dir/read_file/search_files/grep_content/web_search/web_fetch/search_parent_memory/read_parent_output）；"
-        "写文件、执行命令属于敏感操作，会先请求人工审批。\n"
-        "3) 复杂任务先规划、分步执行；每步基于上一步结果推进，成功才继续；失败时分析原因、换策略，"
+    """组装发给模型的消息：分层 system 提示（身份/角色/工具指引/技能/项目上下文）+ 记忆 + 父产出 + 历史 + 输入。
+
+    分层遵循 dsh（DeepSeek Harness）的 system-prompt section 思想——职责分离、明确可读：
+      - 身份（你是谁）
+      - 角色 persona（怎么工作：先探测后行动/自主推进/安全）
+      - 工具指引（用什么工具、什么时候用、关键用法）
+      - 技能清单 + 项目上下文 + 记忆 + 上游产出 + 历史
+    """
+    # ---- 身份层 ----
+    identity = "你是本卡片的专属执行 agent（一个自主的多工具 AI 智能体）。"
+
+    # ---- 角色 persona 层（工作原则）----
+    persona = (
+        "【工作模式：先探测、后行动】\n"
+        "1) 先用工具核实事实（列目录/读文件/检索/搜索），再下结论或动手；不确定时不要臆造，用工具确认。\n"
+        "2) 复杂任务先规划、分步执行；每步基于上一步结果推进，成功才继续；失败时分析原因、换策略，"
         "同一操作连续失败 2 次即停止并反馈，不要盲目重试。\n"
-        "4) 每一步实施后自检：改动是否最小、是否验证过；能用工具验证就用工具验证。\n"
-        "5) 上游任务只给摘要索引；需要细节时调用 read_parent_output（取完整内容）或 search_parent_memory（语义检索片段）。\n"
-        "【联网搜索】\n"
-        "6) web_search 会返回「标题 + 摘要 + URL」。摘要信息已足够回答时，直接基于摘要回答，不必再抓原文；"
-        "只有摘要不足时才用 URL 调 web_fetch。抓取失败（动态渲染/反爬）就改用摘要或换来源回答，"
-        "不要反复重抓同一页面。\n"
-        "【输出格式】\n"
-        "7) 最终回答用中文，结构化：先给结论，再给关键过程（含用到的工具/文件），最后给下一步建议（无则省略）。\n"
-        "8) 不要编造工具结果或文件内容；把不确定处明确标为「待确认」。\n"
+        "3) 每一步实施后自检：改动是否最小、是否验证过；能用工具验证就用工具验证。\n"
         "【自主推进】\n"
-        "9) 你是高自主执行 agent：一次任务尽量自己拆解、连续调用工具推进到最后并完成，"
+        "4) 你是高自主执行 agent：一次任务尽量自己拆解、连续调用工具推进到最后并完成，"
         "不要每步都停下来等确认；除非遇到需要人工决策/敏感操作/或实在无法继续，否则自主完成闭环。\n"
-        "10) 任务结束时明确说「完成」并总结做了什么；不要输出「还需你确认下一步」这类半途而废的结束语。\n"
+        "5) 任务结束时明确说「完成」并总结做了什么；不要输出「还需你确认下一步」这类半途而废的结束语。\n"
+        "【输出格式】\n"
+        "6) 最终回答用中文，结构化：先给结论，再给关键过程（含用到的工具/文件），最后给下一步建议（无则省略）。\n"
+        "7) 不要编造工具结果或文件内容；把不确定处明确标为「待确认」。\n"
         "【自我验证】\n"
-        "11) 写完文件、改完或执行完关键操作后，主动运行验证（读回文件/执行命令/编译/测试）确认结果无误再收尾；"
+        "8) 写完文件、改完或执行完关键操作后，主动运行验证（读回文件/执行命令/编译/测试）确认结果无误再收尾；"
         "验证不通过就继续修正，不要直接下结论。\n"
         "【安全】\n"
-        "12) 不打印 API Key、密码等敏感信息；工具操作限制在工作目录内，路径越界会被拒绝。"
+        "9) 不打印 API Key、密码等敏感信息；工具操作限制在工作目录内，路径越界会被拒绝；"
+        "写文件、执行命令、运行代码属敏感操作，会先请求人工审批。"
     )
-    msgs: list[dict] = [{"role": "system", "content": system}]
+
+    # ---- 工具指引层（dsh 每个工具自带 guidance 的思想）----
+    tool_guidance = (
+        "【工具使用指引】\n"
+        "· 阅读文件一律用 read（带行号、可 offset/limit 分页），不要用 cat。\n"
+        "· 修改已存在文件的局部内容用 edit（精确替换 old_string；默认要求唯一，多次匹配需更精确或 replace_all=true）。"
+        "edit 前必须先 read 过该文件，否则会被拒绝。\n"
+        "· 联网搜索用 web_search：一次可传 queries=[多个不同角度关键词]（1-4 个），系统会并行搜索、合并去重，"
+        "DeepSeek 会返回高质量综合答案 + 权威来源。对重要/易错/需多方求证的信息，务必提供多个不同关键词以获得交叉验证；"
+        "答案中要引用来源 URL。需要抓取某页正文时用 web_fetch（自动转为 Markdown）。\n"
+        "· 上游任务只给摘要索引；需要细节时调用 read_parent_output（取完整内容）或 search_parent_memory（语义检索片段）。\n"
+        "· 子任务可派生子代理完成（run_subagent），复杂任务建议拆成多个子任务。"
+    )
+
+    # ---- 组装分层 system 消息 ----
+    msgs: list[dict] = [
+        {"role": "system", "content": identity},
+        {"role": "system", "content": persona},
+        {"role": "system", "content": tool_guidance},
+    ]
 
     # 已加载的 skill 能力清单
     if skills_text.strip():
@@ -75,6 +106,14 @@ def build_messages(
     # 卡片滚动记忆（历史对话/任务的压缩摘要，避免失忆）
     mem = memory or {}
     mem_parts = []
+    # 长期目标（goal）：让 agent 在多轮/多步执行中始终记得主攻方向（对齐 dsh goal）
+    if mem.get("goal"):
+        goal_round = mem.get("goal_round") or 0
+        mem_parts.append(
+            f"【持续目标】{str(mem['goal'])[:400]}\n"
+            f"（第 {goal_round} 轮推进中。目标尚未完成前，本轮继续朝它推进；"
+            f"若本轮已彻底完成该目标，请在最终回复末尾单独一行写 [GOAL_DONE]。）"
+        )
     if mem.get("summary"):
         mem_parts.append(f"本卡片历史摘要：{mem['summary']}")
     if mem.get("key_facts"):
@@ -117,7 +156,12 @@ def build_messages(
 
 
 async def stream_chat(base_url: str, api_key: str, model: str, messages: list[dict], temperature: float = 0.7):
-    """流式调用 OpenAI 兼容 chat completions，逐段 yield 文本增量。"""
+    """流式调用 OpenAI 兼容 chat completions，逐段 yield 文本增量。
+
+    对齐 dsh-llm-retry：请求建立阶段(限流/5xx/连接错误)退避重试；开始产出后不重试。
+    """
+    import asyncio as _aio
+    import random as _rnd
     url = f"{base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -129,24 +173,49 @@ async def stream_chat(base_url: str, api_key: str, model: str, messages: list[di
         "stream": True,
         "temperature": temperature,
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                import json
-                try:
-                    chunk = json.loads(data)
-                except Exception:
-                    continue
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
+
+    async def _one_attempt(started: bool):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    if (not started) and resp.status_code in (408, 429, 500, 502, 503, 504):
+                        raise _RetryableHTTP(resp.status_code)
+                    resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = __import__("json").loads(data)
+                    except Exception:
+                        continue
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+
+    attempts = 0
+    started = False
+    while True:
+        try:
+            async for ev in _one_attempt(started):
+                started = True
+                yield ev
+            break
+        except _RetryableHTTP:
+            attempts += 1
+            if attempts > 3:
+                raise
+            delay = min(15.0, 1.0 * (2 ** (attempts - 1)) * (0.5 + _rnd.random()))
+            await _aio.sleep(delay)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TransportError) as _te:
+            attempts += 1
+            if attempts > 3 or started:
+                raise
+            delay = min(15.0, 1.0 * (2 ** (attempts - 1)) * (0.5 + _rnd.random()))
+            await _aio.sleep(delay)
 
 
 async def stream_chat_with_tools(
@@ -157,7 +226,12 @@ async def stream_chat_with_tools(
     yield {"type":"delta","text":...}  每段文本增量
     yield {"type":"done","tool_calls":[...]}  本轮结束时若模型要调工具
     yield {"type":"done","tool_calls":[]}     本轮结束无工具
+
+    对齐 dsh-llm-retry：请求建立阶段(限流 429/5xx/连接错误)用指数退避+抖动自动重试。
+    一旦已开始产出正文，则不再重试（避免重复 token）。
     """
+    import asyncio as _aio
+    import random as _rnd
     url = f"{base_url}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload: dict = {"model": model, "messages": messages, "stream": True, "temperature": temperature}
@@ -168,57 +242,92 @@ async def stream_chat_with_tools(
     import json as _json
     tool_calls_acc: dict[int, dict] = {}
     reasoning_acc = ""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            if resp.status_code >= 400:
-                body = await resp.aread()
-                # 打印出供应商返回的具体错误，便于定位 400 原因
-                print(
-                    "[LLM 400]",
-                    resp.status_code,
-                    body.decode("utf-8", errors="replace")[:1500],
-                    flush=True,
-                )
-                # 打印最后 5 条消息的结构，便于定位不足的 tool 消息
-                try:
-                    for _m in messages[-5:]:
-                        _role = _m.get("role")
-                        _info = {
-                            "role": _role,
-                            "has_tool_calls": bool(_m.get("tool_calls")),
-                            "tool_call_ids": [t.get("id") for t in (_m.get("tool_calls") or [])] if _m.get("tool_calls") else None,
-                            "tool_call_id": _m.get("tool_call_id"),
-                            "has_reasoning": "reasoning_content" in _m,
-                        }
-                        print("[LLM 400 msg]", _json.dumps(_info, ensure_ascii=False), flush=True)
-                except Exception:
-                    pass
-                resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = _json.loads(data)
-                except Exception:
-                    continue
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content")
-                if delta.get("reasoning_content"):
-                    reasoning_acc += delta["reasoning_content"]
-                if content:
-                    yield {"type": "delta", "text": content}
-                for tc in delta.get("tool_calls") or []:
-                    idx = tc.get("index", 0)
-                    acc = tool_calls_acc.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                    if tc.get("id"):
-                        acc["id"] = tc["id"]
-                    if tc.get("function", {}).get("name"):
-                        acc["function"]["name"] = tc["function"]["name"]
-                    if tc.get("function", {}).get("arguments"):
-                        acc["function"]["arguments"] += tc["function"]["arguments"]
+
+    async def _one_attempt(started: bool):
+        """发起一次请求并 yield；HTTP 429/5xx 可重试时抛 _Retryable，否则原样传播。"""
+        nonlocal tool_calls_acc, reasoning_acc
+        if not tools:
+            # 无工具时也保持同一入口（由调用方决定是否传 tools）
+            pass
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    # 可重试：限流/5xx 且尚未产出内容
+                    if (not started) and resp.status_code in (408, 429, 500, 502, 503, 504):
+                        raise _RetryableHTTP(resp.status_code)
+                    body = await resp.aread()
+                    # 打印出供应商返回的具体错误，便于定位 400 原因
+                    print(
+                        "[LLM", resp.status_code, "]",
+                        body.decode("utf-8", errors="replace")[:1500],
+                        flush=True,
+                    )
+                    # 打印最后 5 条消息的结构，便于定位不足的 tool 消息
+                    try:
+                        for _m in messages[-5:]:
+                            _role = _m.get("role")
+                            _info = {
+                                "role": _role,
+                                "has_tool_calls": bool(_m.get("tool_calls")),
+                                "tool_call_ids": [t.get("id") for t in (_m.get("tool_calls") or [])] if _m.get("tool_calls") else None,
+                                "tool_call_id": _m.get("tool_call_id"),
+                                "has_reasoning": "reasoning_content" in _m,
+                            }
+                            print("[LLM msg]", _json.dumps(_info, ensure_ascii=False), flush=True)
+                    except Exception:
+                        pass
+                    resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = _json.loads(data)
+                    except Exception:
+                        continue
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if delta.get("reasoning_content"):
+                        reasoning_acc += delta["reasoning_content"]
+                    if content:
+                        yield {"type": "delta", "text": content}
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        acc = tool_calls_acc.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            acc["id"] = tc["id"]
+                        if tc.get("function", {}).get("name"):
+                            acc["function"]["name"] = tc["function"]["name"]
+                        if tc.get("function", {}).get("arguments"):
+                            acc["function"]["arguments"] += tc["function"]["arguments"]
+
+    # 重试循环：可重试错误退避，最多 3 次；一旦 yield 过真实内容即标记 started 不在重试
+    tool_calls_acc = {}
+    reasoning_acc = ""
+    attempts = 0
+    started = False
+    while True:
+        try:
+            async for ev in _one_attempt(started):
+                if ev["type"] == "delta":
+                    started = True
+                yield ev
+            break
+        except _RetryableHTTP:
+            attempts += 1
+            if attempts > 3:
+                raise
+            delay = min(15.0, 1.0 * (2 ** (attempts - 1)) * (0.5 + _rnd.random()))
+            await _aio.sleep(delay)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TransportError) as _te:
+            attempts += 1
+            if attempts > 3 or started:
+                raise
+            delay = min(15.0, 1.0 * (2 ** (attempts - 1)) * (0.5 + _rnd.random()))
+            await _aio.sleep(delay)
+
     ordered = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
     yield {"type": "done", "tool_calls": ordered, "reasoning_content": reasoning_acc}
 
@@ -358,61 +467,84 @@ async def compact_history(
     history: list[dict],
     keep_recent: int = 6,
     max_old_chars: int = 6000,
+    budget_tokens: int = 0,
 ) -> list[dict]:
-    """长对话实时压缩：把「最近 keep_recent 条」之外的更早历史，用 LLM 折叠成一条摘要消息。
+    """长对话实时压缩（对齐 dsh compaction-basic 的 token 压力驱动思想）。
 
-    目的：替代原来的「滚动截断」（只留最后 12 条、每条截 2000 字），做到
-    信息有摘要、不因长度机械丢弃。模型不可用/失败时退化为简单拼接，不阻塞调用。
+    改进点（相对旧版）：
+    - token 压力驱动：当整体(系统提示+历史)估算 token 超过 budget_tokens 时触发，
+      旧版是固定字符阈值，新版按模型上下文预算自适应。
+    - 保留最近 tail（keep_recent 条原文），更早历史用 LLM 压成摘要。
+    - 摘要带 <compacted-summary> 标记（dsh 语义），下轮明确这是压缩过的历史。
+    - 收敛校验：摘要若未比源 token 更小，则降级为更大力度压缩/截断，不回退到未压缩。
+    模型不可用/失败时退化为截断拼接，不阻塞调用。
     """
     if not history:
         return history
 
-    # 老历史 = 去掉最近 keep_recent 条后剩余
+    # ---- token 压力判断：整体估算超过预算才压缩 ----
+    total_tokens = sum(_est_tokens(_msg_chars(m)) for m in history)
+    if budget_tokens > 0 and total_tokens <= budget_tokens:
+        return history  # 未超压，直接透传（对齐 dsh 压力未超标不压缩）
+
+    # 老历史 = 去掉最近 keep_recent 条后剩余；最近 tail 保留原文
     old = history[:-keep_recent] if len(history) > keep_recent else []
     recent = history[-keep_recent:] if len(history) > keep_recent else history
 
-    # 压缩目标是「超量且非空」的老历史；若老历史本身很短，直接透传（最近条已含全部）
     old_chars = sum(_msg_chars(m) for m in old)
+    # 保守字符下限（与旧版一致）：老历史确实超量才压
     if not old or old_chars <= max_old_chars:
         return history
 
-    # 逐条折叠：把老历史的 user/assistant 对话压成要点
-    folded_lines: list[str] = []
-    for m in old:
-        role = m.get("role", "")
-        text = (m.get("text", "") or "").strip()
-        if not text:
-            continue
-        prefix = "用户" if role == "user" else ("助手" if role == "assistant" else role)
-        folded_lines.append(f"{prefix}：{text[:600]}")
+    def _fold(folded: list[str]) -> list[str]:
+        """把老历史逐条折叠成要点行。"""
+        lines: list[str] = []
+        for m in old:
+            role = m.get("role", "")
+            text = (m.get("text", "") or "").strip()
+            if not text:
+                continue
+            prefix = "用户" if role == "user" else ("助手" if role == "assistant" else role)
+            lines.append(f"{prefix}：{text[:600]}")
+        return lines
 
-    if not folded_lines:
+    async def _try_summarize(folded: list[str], max_summary_len: int) -> str:
+        prompt = (
+            f"下面是某任务卡片更早的一段多轮对话。请把它的关键信息压缩成一段不超过 {max_summary_len} 字的中文摘要。"
+            "保留：用户的需求、已确认的事实、已做的决定、关键结论。丢弃寒暄和无用往返。\n"
+            "只输出摘要正文，不要其他文字：\n\n"
+            + "\n".join(folded[-40:])
+        )
+        msgs = [
+            {"role": "system", "content": "你是上下文压缩器，产出信息无损的紧凑摘要。"},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            content = await _chat_once_text(base_url, api_key, model, msgs)
+            return (content or "").strip()
+        except Exception:
+            return ""
+
+    folded = _fold([])
+    if not folded:
         return history
 
-    prompt = (
-        "下面是某任务卡片更早的一段多轮对话。请把它的关键信息压缩成一段不超过 200 字的中文摘要。"
-        "保留：用户的需求、已确认的事实、已做的决定、关键结论。丢弃寒暄和无用往返。\n"
-        "只输出摘要正文，不要其他文字：\n\n"
-        + "\n".join(folded_lines[-40:])
-    )
-    msgs = [
-        {"role": "system", "content": "你是上下文压缩器，产出信息无损的紧凑摘要。"},
-        {"role": "user", "content": prompt},
-    ]
-    summary = ""
-    try:
-        content = await _chat_once_text(base_url, api_key, model, msgs)
-        summary = (content or "").strip()
-    except Exception:
-        summary = ""
+    # 首次摘要尝试
+    summary = await _try_summarize(folded, 200)
+    # 收敛校验：若摘要没有明显更小（token 相仿或更大），再压一次更狠的限制
+    if summary:
+        src_tok = sum(_est_tokens(l) for l in folded)
+        sum_tok = _est_tokens(summary)
+        if sum_tok > src_tok * 0.6:
+            summary = await _try_summarize(folded, 100)
 
-    # 生成压缩后的历史：摘要块 + 最近原文
+    # 生成压缩后的历史：<compacted-summary> 标记 + 最近原文（对齐 dsh 的 checkpoint framing）
     compacted: list[dict] = []
     if summary:
-        compacted.append({"role": "system", "text": f"【更早对话摘要】{summary[:800]}"})
+        compacted.append({"role": "system", "text": f"<compacted-summary>\n{summary[:1000]}\n</compacted-summary>"})
     else:
-        # LLM 失败回退：把老历史合成一条（尽量小）
-        fallback = "；".join(l for l in folded_lines)[-1600:]
-        compacted.append({"role": "system", "text": f"【更早对话（截断）】{fallback}"})
+        # LLM 失败回退：把老历史合成一条（尽量小，保留尾部信息）
+        fallback = "；".join(folded)[-1600:]
+        compacted.append({"role": "system", "text": "<compacted-summary>\n" + fallback + "\n</compacted-summary>"})
     compacted.extend(recent)
     return compacted

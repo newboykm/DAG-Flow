@@ -3,6 +3,10 @@ import { createPortal } from 'react-dom';
 import { useGraphStore } from '../store/useGraphStore';
 import { STATUS_META } from '../graph/statusMeta';
 import { api } from '../api';
+import MarkdownBlock from './MarkdownBlock';
+import TrustLevelPicker from './TrustLevelPicker';
+import ExecTimeline from './ExecTimeline';
+import ExecLivePreview from './ExecLivePreview';
 import type { AppendMode, DagNode } from '../types';
 
 const MODE_LABEL: Record<AppendMode, string> = { serial: '串行', parallel: '并行', join: 'join' };
@@ -130,9 +134,9 @@ export default function TaskNodeCard(props: Props) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      // 鼠标落在内置滚动区（执行过程 / 任务栏）时，滚动它自身，不滚聊天区
+      // 鼠标落在内置滚动区（执行轨迹 / 执行过程 / 任务进度 / 审批参数）时，滚动它自身，不滚聊天区
       const t = e.target as HTMLElement | null;
-      const scroller = t && t.closest ? t.closest('.exec-fold-body, .exec-body') : null;
+      const scroller = t && t.closest ? t.closest('.exec-fold-body, .exec-body, .tl-body, .card-approval-args') : null;
       if (scroller) {
         scroller.scrollTop += e.deltaY;
         return;
@@ -182,7 +186,7 @@ export default function TaskNodeCard(props: Props) {
       window.clearTimeout(clickTimer.current);
       clickTimer.current = null;
     }
-    // 双击开/关窗口（多窗口）：打开时用画布可视区尺寸作为初始铺满大小
+    // 双击开/关窗口（多窗口）：打开时铺满画布可视区（恢复之前大小）
     const canvasEl = document.querySelector('.canvas') as HTMLElement | null;
     const cw = canvasEl?.clientWidth ?? window.innerWidth;
     const ch = canvasEl?.clientHeight ?? window.innerHeight;
@@ -504,16 +508,22 @@ export default function TaskNodeCard(props: Props) {
       ) : (
         <div className="card-body-expanded">
           <ParentContextCard parentContext={node.parentContext ?? []} />
-          <ExecutionCard plan={node.plan} running={node.status === 'running'} />
+          <ExecTimeline nodeId={node.nodeId} running={node.status === 'running'} refreshKey={node.updatedAt ?? 0} />
           <div className="chat-flow" ref={chatRef}>
             {(() => {
-              // 把消息按「每条 user/assistant 回复 + 它下面的执行步骤」分组
-              const groups: { msg: any; steps: any[] }[] = [];
+              // 对齐 dsh：按"每条 user 提问 = 一组"分组。
+              // - 同一轮里所有 assistant 回复合并到一个框（markdown 层级结构）
+              // - 该轮的执行步骤整合到一个"执行过程"折叠块，与消息框接壤
+              const groups: { user: any; replies: any[]; steps: any[] }[] = [];
               for (const m of node.messages ?? []) {
-                if (m.role === 'system') {
-                  if (groups.length) groups[groups.length - 1].steps.push(m);
+                if (m.role === 'user') {
+                  groups.push({ user: m, replies: [], steps: [] });
+                } else if (m.role === 'assistant') {
+                  if (groups.length) groups[groups.length - 1].replies.push(m);
+                  else groups.push({ user: null as any, replies: [m], steps: [] });
                 } else {
-                  groups.push({ msg: m, steps: [] });
+                  // system 步骤 → 挂到当前组（执行过程）
+                  if (groups.length) groups[groups.length - 1].steps.push(m);
                 }
               }
               if (groups.length === 0) {
@@ -521,49 +531,57 @@ export default function TaskNodeCard(props: Props) {
               }
               return (
                 <>
-                  {groups.map((g) => (
-                    <div key={g.msg.id} className="chat-group">
-                      {/* 上面：这一轮的执行过程折叠块（实时展开 / 完成后收起） */}
-                      {g.steps.length > 0 ? (
-                        <details className="exec-fold">
-                          <summary className="exec-fold-head">
-                            <span className="exec-fold-icon">🧭</span>
-                            <span>执行过程（{g.steps.length} 步）</span>
-                            <span className="exec-fold-chevron" />
-                          </summary>
-                          <div className="exec-fold-body">
-                            {g.steps.map((s: any) => {
-                              const st = stepStatus(s.step || '');
-                              return (
-                                <div key={s.id} className={`agent-step agent-step-${st}`}>
-                                  <span className={`input-icon exec-step-${st}`}>{statusIcon(st)}</span>
-                                  <span className="agent-step-label">{s.step || '执行'}</span>
-                                  {s.detail ? <span className="agent-step-detail">{s.detail}</span> : null}
-                                </div>
-                              );
-                            })}
+                  {groups.map((g, gi) => (
+                    <div key={g.user?.id ?? `g${gi}`} className="chat-group">
+                      {/* 用户提问 */}
+                      {g.user ? (
+                        <div className="chat-msg chat-user">
+                          <div className="chat-bubble-wrap">
+                            <div className="chat-bubble">{g.user.text}</div>
+                            {/* 用户消息的一键复制：放在消息框外面 */}
+                            <button
+                              className="copy-btn"
+                              title="复制"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (g.user.text) navigator.clipboard?.writeText(g.user.text);
+                              }}
+                            >
+                              ⧉
+                            </button>
                           </div>
-                        </details>
-                      ) : null}
-                      {/* 下面：这一轮的消息回复 */}
-                      <div className={`chat-msg chat-${g.msg.role}`}>
-                        <div className="chat-bubble-wrap">
-                          <div className="chat-bubble">
-                            {g.msg.text}
-                            {g.msg.streaming ? <span className="chat-cursor">▍</span> : null}
-                          </div>
-                          <button
-                            className="copy-btn"
-                            title="复制"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (g.msg.text) navigator.clipboard?.writeText(g.msg.text);
-                            }}
-                          >
-                            ⧉
-                          </button>
                         </div>
-                      </div>
+                      ) : null}
+                      {/* 同一轮的所有 assistant 回复 → 合并一个框（markdown 层级），一键复制在右下角 */}
+                      {g.replies.length > 0 ? (
+                        <div className="chat-msg chat-assistant">
+                          <div className="chat-bubble-wrap">
+                            <div className="chat-bubble">
+                              {/* 仅当前正在回复的气泡显示执行步骤；已回复的气泡保持最终内容 */}
+                              {node.status === 'running' && gi === groups.length - 1 && g.replies.some((rr) => rr.streaming) ? (
+                                <ExecLivePreview nodeId={node.nodeId} running />
+                              ) : null}
+                              {g.replies.map((r, ri) => (
+                                <div key={r.id ?? ri} className="assistant-reply">
+                                  <MarkdownBlock text={r.text} />
+                                  {r.streaming ? <span className="chat-cursor">▍</span> : null}
+                                </div>
+                              ))}
+                              <button
+                                className="copy-btn"
+                                title="复制"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const all = g.replies.map((r) => r.text).join('\n');
+                                  if (all) navigator.clipboard?.writeText(all);
+                                }}
+                              >
+                                ⧉
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </>
@@ -576,6 +594,8 @@ export default function TaskNodeCard(props: Props) {
           ) : null}
 
           <div className="chat-input-box">
+            {/* 任务进度栏：融入输入栏，样式与输入栏一致 */}
+            <ExecutionCard plan={node.plan} running={node.status === 'running'} />
             <div className="chat-input-top">
               <textarea
                 ref={inputRef}
@@ -664,6 +684,7 @@ export default function TaskNodeCard(props: Props) {
                   </option>
                 ))}
               </select>
+              <TrustLevelPicker />
             </div>
           </div>
 
@@ -860,17 +881,6 @@ function ParentContextCard({ parentContext }: { parentContext: { parentNodeId: s
       ) : null}
     </div>
   );
-}
-
-function stepStatus(label: string): 'pending' | 'done' | 'reject' | 'run' {
-  if (label.includes('拒绝') || label.includes('失败')) return 'reject';
-  if (label.includes('待审批')) return 'pending';
-  if (label.includes('执行') || label.includes('调用')) return 'run';
-  return 'done';
-}
-
-function statusIcon(s: string): string {
-  return s === 'reject' ? '✗' : s === 'pending' ? '⏳' : s === 'run' ? '⚙' : '✓';
 }
 
 function QuickCreateButtons({ nodeId, compact }: { nodeId: string; compact?: boolean }) {

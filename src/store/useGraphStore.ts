@@ -581,10 +581,22 @@ export const useGraphStore = create<GraphState>()((set, get) => {
       const t = text.trim();
       if (!t) return;
       try {
+        // 父子互斥预检：有父或子节点在执行时，提醒用户且不发送
+        const cc = await api.checkConcurrency(id);
+        if (cc?.blocked) {
+          const who = cc.runningTitles?.length ? cc.runningTitles.join('、') : cc.runningRelatives?.join('、') ?? '';
+          alert(`⚠ 无法同时执行：${cc.message ?? '有父节点或子节点正在执行'}${who ? `（正在执行：${who}）` : ''}`);
+          return;
+        }
         const node = await api.sendMessage(id, t);
         set((s) => ({ nodes: upsertNode(s.nodes, toDagNode(node)) }));
       } catch (e) {
-        console.error('发送消息失败', e);
+        const anyErr = e as any;
+        if (anyErr?.response?.status === 409 && anyErr?.response?.detail) {
+          alert(`⚠ 无法执行：${anyErr.response.detail}`);
+        } else {
+          console.error('发送消息失败', e);
+        }
       }
     },
 

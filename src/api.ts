@@ -80,11 +80,27 @@ export const api = {
   getSkills: () =>
     request<{ skillDir: string; skills: { name: string; description: string; path: string }[] }>(`/api/skills`),
 
+  getNodeEvents: (nid: string) =>
+    request<{ nodeId: string; count: number; events: any[] }>(`/api/nodes/${nid}/events`),
+
   saveSkills: (skillDir: string) =>
     request<{ skillDir: string; skills: { name: string; description: string; path: string }[] }>(`/api/skills`, {
       method: 'PUT',
       body: JSON.stringify({ skillDir }),
     }),
+
+  getTrustLevel: () =>
+    request<{ level: string; levels: string[]; labels: Record<string, string>; desc: Record<string, string> }>(
+      `/api/trust-level`,
+    ),
+
+  setTrustLevel: (level: string) =>
+    request<{ level: string }>(`/api/trust-level`, { method: 'PUT', body: JSON.stringify({ level }) }),
+
+  checkConcurrency: (nid: string) =>
+    request<{ nodeId: string; blocked: boolean; runningRelatives: string[]; runningTitles: string[]; message: string }>(
+      `/api/nodes/${nid}/concurrency`,
+    ),
 
   getTavilyConfig: () => request<{ apiKey: string }>(`/api/config/tavily`),
 

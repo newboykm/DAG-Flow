@@ -27,6 +27,14 @@ from .models import ContextEntry, ContextBlock, Approval, AppConfig, McpServer
 from .model_config import ModelConfig, ModelProvider, PROVIDER_PRESETS, seed_providers, available_models
 from .dag import compute_initial_status, would_create_cycle
 
+# Windows 下 asyncio 子进程（exec_command）需要 Proactor 事件循环；
+# 在事件循环创建前设置策略，避免 SelectorEventLoop 抛 NotImplementedError。
+if os.name == "nt":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -182,6 +190,31 @@ def put_model_config(body: dict, db: OrmSession = Depends(get_db)):
         p.enabled = bool(p.apiKey and p.baseUrl)
     db.commit()
     return get_model_config(db)
+
+
+@app.get("/api/trust-level")
+def get_trust_level():
+    """读取审核信任档：all(全部信任)/partial(部分信任)/none(全部不信任)。"""
+    from .trust import get_trust_level, TRUST_LEVELS
+    cur = get_trust_level()
+    return {
+        "level": cur,
+        "levels": list(TRUST_LEVELS),
+        "labels": {"all": "全部信任", "partial": "部分信任", "none": "全部不信任"},
+        "desc": {
+            "all": "敏感操作全部免审批，agent 全自主",
+            "partial": "危险命令/运行代码需审批，普通写文件免审",
+            "none": "所有写/编辑/命令/运行代码都要人工审批",
+        },
+    }
+
+
+@app.put("/api/trust-level")
+def put_trust_level(body: dict, db: OrmSession = Depends(get_db)):
+    """设置审核信任档。"""
+    from .trust import set_trust_level, TRUST_LEVELS
+    level = set_trust_level(str(body.get("level", "")), db)
+    return {"level": level, "levels": list(TRUST_LEVELS)}
 
 
 @app.get("/api/model-presets")
@@ -433,6 +466,45 @@ def get_node(nid: str, db: OrmSession = Depends(get_db)):
     return _node_out(n)
 
 
+@app.get("/api/nodes/{nid}/events")
+def get_node_events(nid: str, db: OrmSession = Depends(get_db)):
+    """返回某个节点本次+历史的执行事件流（对齐 dsh 的 session event log 可视化）。
+
+    让前端能实时渲染 agent 执行的细粒度过程（turn→step→工具→chunk 的轨迹），
+    而不是只看到整批 messages 结果。
+    """
+    n = db.get(Node, nid)
+    if not n:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    from . import event_log
+    events = event_log.read_events(n.sessionId, nid)
+    return {"nodeId": nid, "count": len(events), "events": events}
+
+
+@app.get("/api/nodes/{nid}/concurrency")
+def check_node_concurrency(nid: str, db: OrmSession = Depends(get_db)):
+    """检测父子互斥：该节点的父链/子链上是否有正在运行的节点。
+
+    用于"父子不能同时执行"：若命中，前端应提醒用户（如父节点正执行中，子节点需等待）。
+    """
+    n = db.get(Node, nid)
+    if not n:
+        raise HTTPException(status_code=404, detail="节点不存在")
+    nodes = db.query(Node).filter(Node.sessionId == n.sessionId).all()
+    status_of = {x.nodeId: x.status for x in nodes}
+    parents = {x.nodeId: set(x.parentIds or []) for x in nodes}
+    from .dag import running_relatives
+    running = running_relatives({nid}, status_of, parents)
+    titles = {x.nodeId: x.title for x in nodes}
+    return {
+        "nodeId": nid,
+        "blocked": len(running) > 0,
+        "runningRelatives": running,
+        "runningTitles": [titles.get(r, r) for r in running],
+        "message": ("有相关节点正在执行，父子不可同时执行。" if running else "无冲突，可执行。"),
+    }
+
+
 @app.patch("/api/nodes/{nid}", response_model=NodeOut)
 def update_node(nid: str, req: UpdateNodeRequest, db: OrmSession = Depends(get_db)):
     n = db.get(Node, nid)
@@ -468,8 +540,16 @@ def cancel_node(nid: str, db: OrmSession = Depends(get_db)):
     db.commit()
     db.refresh(n)
     # 通知正在执行的 _run_real 协作式停止
-    from .scheduler import request_cancel
-    request_cancel(nid)
+    from . import scheduler as _sched
+    _sched.request_cancel(nid)
+    # 若真实执行任务仍在跑，直接中断其 asyncio task（避免等待当前流式完成）
+    try:
+        task = _sched._real_exec_tasks.get(nid)
+        if task and not task.done():
+            task.cancel()
+    except Exception:
+        pass
+    print(f"[cancel] 节点 {nid} 已置 cancelled 并请求取消", flush=True)
     return _node_out(n)
 
 
@@ -589,6 +669,25 @@ def send_message(nid: str, req: SendMessageRequest, db: OrmSession = Depends(get
             sess.title = text[:20] + ("…" if len(text) > 20 else "")
 
     messages.append({"id": _gen_id("m"), "role": "user", "text": text, "at": now_ms})
+
+    # ---- 父子互斥：若本节点的父链或子链上有正在运行的节点，则提醒并阻止同时执行 ----
+    try:
+        nodes_all = db.query(Node).filter(Node.sessionId == n.sessionId).all()
+        status_of = {x.nodeId: x.status for x in nodes_all}
+        parents_of = {x.nodeId: set(x.parentIds or []) for x in nodes_all}
+        from .dag import running_relatives
+        running = running_relatives({nid}, status_of, parents_of)
+        if running:
+            titles = {x.nodeId: x.title for x in nodes_all}
+            names = [titles.get(r, r) for r in running]
+            raise HTTPException(
+                status_code=409,
+                detail=f"父节点或子节点正在执行中（{'、'.join(names)}），父子不可同时执行。请等它完成后重试。",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # 校验失败不阻断
 
     # 执行时机：pending 节点若来源全部 done 则就绪；否则等待
     if n.status in ("pending", "done", "failed", "cancelled", "blocked"):

@@ -77,14 +77,41 @@ def _parse_skill_file(path: str, default_name: str) -> dict | None:
 
 
 def skills_prompt(skill_dir: str) -> str:
-    """把所有 skill 的描述整理成一段 prompt 文本注入 system prompt。"""
+    """生成 skill 目录清单（catalog）文本，注入 system prompt。
+
+    对齐 dsh 的按需加载：system prompt 里只放「技能名 + 一句话描述」（省 token、不稀释注意力），
+    并告知 agent：命中某 skill 时调用 skill(name) 工具加载完整指令。
+    """
     skills = list_skills(skill_dir)
     if not skills:
         return ""
-    lines = ["【可用 Skill（能力清单）】", "你可以参考以下 skill 的约定来工作："]
+    lines = ["【可用 Skill（能力清单）】", "任务若与下面某个 skill 匹配，请调用 skill 工具传入其名字加载完整指令后再按它执行："]
     for s in skills:
-        lines.append(f"- {s['name']}: {s['description'][:120]}")
+        lines.append(f"- {s['name']}: {s['description'][:100]}")
     return "\n".join(lines)
+
+
+def get_skill(name: str, custom_dir: str | None = None) -> dict | None:
+    """按名字查找 skill 并返回【完整指令】，供 skill 工具按需加载。
+
+    返回 {name, description, content, path}；找不到返回 None。
+    在 (内置, 自定义) 目录里按名字匹配（精确，忽略大小写）。
+    """
+    name_low = (name or "").strip().lower()
+    if not name_low:
+        return None
+    for d in (default_skill_dir(), custom_dir):
+        if not d or not os.path.isdir(d):
+            continue
+        for s in list_skills(d):
+            if s["name"].lower() == name_low:
+                try:
+                    with open(s["path"], "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                    return {"name": s["name"], "description": s["description"], "content": content, "path": s["path"]}
+                except Exception:
+                    return None
+    return None
 
 
 def load_all_skills_prompt(custom_dir: str | None) -> str:

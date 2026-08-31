@@ -13,8 +13,9 @@ import os
 import re
 
 # 关闭 chromadb 遥测（减少噪音/网络请求）
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
-os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "none")
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+os.environ["CHROMA_TELEMETRY_IMPL"] = "none"
+os.environ["CHROMA_ANONYMIZED_TELEMETRY"] = "False"
 # HuggingFace 国内镜像（加速模型下载；可被外部覆盖）
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -55,7 +56,25 @@ def _get_client():
     global _client
     if _client is None:
         import chromadb
-        _client = chromadb.PersistentClient(path=CHROMA_PATH)
+        # 屏蔽 chromadb 匿名遥测：本版本 Posthog 客户端调 posthog.capture 签名不兼容，
+        # 每次操作都打印失败日志。把实际提交函数 _direct_capture 替换为空操作。
+        try:
+            from chromadb.telemetry.product.posthog import Posthog as _Posthog
+            _Posthog._direct_capture = lambda self, event: None
+        except Exception:
+            pass
+        # 兜底：连 Posthog 类都拿不到时，patch 基类抽象方法（影响后续新实例）
+        try:
+            from chromadb.telemetry.product import ProductTelemetryClient as _PT
+            _PT.capture = lambda self, event: None
+            _PT._direct_capture = lambda self, event: None
+        except Exception:
+            pass
+        from chromadb.config import Settings as ChromaSettings
+        _client = chromadb.PersistentClient(
+            path=CHROMA_PATH,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
     return _client
 
 

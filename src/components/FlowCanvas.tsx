@@ -20,13 +20,15 @@ function EdgePath({
   edge,
   dim,
   layoutById,
+  rootOf,
 }: {
   edge: LayoutEdge;
   dim: boolean;
   layoutById: Map<string, LayoutNode>;
+  rootOf: Map<string, boolean>;
 }) {
   if (edge.points.length === 0) return null;
-  const d = directCurvePath(edge, layoutById);
+  const d = directCurvePath(edge, layoutById, rootOf);
   return (
     <path
       d={d}
@@ -40,15 +42,20 @@ function EdgePath({
 /**
  * 直接连线：固定从父卡片右缘中点出发，到子卡片左缘中点结束，
  * 中间用一条柔和的贝塞尔曲线连接（不做折线）。
+ * 根节点（会话起点）是 20px 圆点且居中于原位置，连线锚点按其圆点边缘对齐。
  */
-function directCurvePath(edge: LayoutEdge, layoutById: Map<string, LayoutNode>): string {
+function directCurvePath(edge: LayoutEdge, layoutById: Map<string, LayoutNode>, rootOf: Map<string, boolean>): string {
   const src = layoutById.get(edge.source);
   const tgt = layoutById.get(edge.target);
   if (!src || !tgt) return '';
 
-  // 固定锚点：父右缘中点、子左缘中点（含 dragOffset，拖动时实时跟随）
-  const s = { x: src.x + src.width, y: src.y + src.height / 2 };
-  const t = { x: tgt.x, y: tgt.y + tgt.height / 2 };
+  // 根节点：圆点中心 = 原布局中心；锚点用圆点边缘（半径 10）
+  const sx = rootOf.get(edge.source) ? src.x + src.width / 2 + 10 : src.x + src.width;
+  const sy = src.y + src.height / 2;
+  const tx = rootOf.get(edge.target) ? tgt.x + tgt.width / 2 - 10 : tgt.x;
+  const ty = tgt.y + tgt.height / 2;
+  const s = { x: sx, y: sy };
+  const t = { x: tx, y: ty };
 
   // 曲线控制点：沿水平方向各延伸一段，让曲线柔和弯曲
   const c1 = {
@@ -171,6 +178,15 @@ export default function FlowCanvas() {
     }
     return m;
   }, [layout.nodes, nodes, collapsed]);
+
+  // 根节点 id 集合：连线锚点对齐圆点
+  const rootIds = useMemo(() => {
+    const m = new Map<string, boolean>();
+    for (const n of Object.values(nodes)) {
+      if (n.kind === 'root') m.set(n.nodeId, true);
+    }
+    return m;
+  }, [nodes]);
 
   const fit = useCallback(() => {
     const el = containerRef.current;
@@ -414,6 +430,7 @@ export default function FlowCanvas() {
                 edge={e}
                 dim={isDimmed(nodes[e.source]) || isDimmed(nodes[e.target])}
                 layoutById={offsetLayoutById}
+                rootOf={rootIds}
               />
             ))}
         </svg>
