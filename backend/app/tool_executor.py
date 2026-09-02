@@ -360,6 +360,19 @@ def _dsh_edit(args: dict, workspace: str) -> str:
     return f"文件 {fp} 已更新成功。" if not replace_all else f"文件 {fp} 已更新成功，所有匹配均已替换。"
 
 
+def _perf_tool(fn):
+    """工具耗时埋点（诊断用，不改逻辑）：记录每个工具的一次调用总耗时并打印一行。"""
+    async def wrapper(*a, **kw):
+        _m = time.monotonic()
+        try:
+            return await fn(*a, **kw)
+        finally:
+            ms = int((time.monotonic() - _m) * 1000)
+            print(f"[tool-perf] name={a[0] if a else '?'} took={ms}ms")
+    return wrapper
+
+
+@_perf_tool
 async def execute(name: str, args: dict, workspace: str, ctx: dict | None = None) -> str:
     """执行一个工具，返回文本结果。抛异常时由调用方处理。
 
@@ -895,6 +908,10 @@ def _web_search(queries: list[str]) -> str:
             formatted = _ws.format_search_result(result)
             # 至少要有答案或来源才算真拿到结果
             if result.get("summary") or result.get("sources"):
+                # 加压顶：native 综合答案常达数千字，全量会给下一轮 LLM 造成过大输入、明显变慢。
+                # 保留开头结论 + 尾部来源引用，裁掉中间冗余，避免上下文随多轮 web_search 无限膨胀。
+                if len(formatted) > 9000:
+                    formatted = formatted[:7000] + "\n…(结果过长已截断，保留核心结论与来源)…\n" + formatted[-1500:]
                 return formatted
     except Exception as e:  # noqa: BLE001
         import traceback as _tb

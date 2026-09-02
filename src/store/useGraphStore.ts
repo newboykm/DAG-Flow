@@ -3,6 +3,17 @@ import type { AppendMode, DagNode, FilterStatus } from '../types';
 import { api, toDagNode, type ContextEntryOut } from '../api';
 import { connectWs } from '../ws';
 
+// ---- 执行事件(exec_event)总线：后端 WS 实时推送执行轨迹，组件订阅刷新 ----
+type ExecListener = (e: any) => void;
+const _execListeners = new Set<ExecListener>();
+export function onExecEvent(cb: ExecListener): () => void {
+  _execListeners.add(cb);
+  return () => { _execListeners.delete(cb); };
+}
+function emitExecEvent(e: any): void {
+  for (const cb of _execListeners) { try { cb(e); } catch { /* ignore */ } }
+}
+
 export const CONCURRENCY = 5;
 const COLLAPSED_KEY = 'dag-card-collapsed';
 
@@ -714,6 +725,10 @@ export const useGraphStore = create<GraphState>()((set, get) => {
             [event.nodeId]: { approvalId: event.approvalId, tool: event.tool, args: event.args },
           },
         }));
+      }
+      if (event.type === 'exec_event') {
+        // 执行轨迹实时事件：广播给订阅组件（ExecTimeline 等）即时刷新
+        emitExecEvent(event);
       }
       if (event.type === 'parent_context_updated' && event.nodeId) {
         // 父节点发布新内容块：更新下游节点的父上下文索引

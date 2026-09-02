@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { onExecEvent } from '../store/useGraphStore';
 
 interface Ev { kind: string; ts?: number; [k: string]: unknown; }
 
@@ -45,7 +46,11 @@ export default function ExecLivePreview({ nodeId, running }: { nodeId: string; r
       load();
       timer.current = window.setInterval(load, 2000);
     }
-    return () => { alive = false; if (timer.current) window.clearInterval(timer.current); };
+    // 订阅 WS 实时 exec_event，动作即时更新
+    const unsub = onExecEvent((e) => {
+      if (e && (e.nodeId === nodeId || e.nodeId === undefined)) load();
+    });
+    return () => { alive = false; unsub(); if (timer.current) window.clearInterval(timer.current); };
   }, [nodeId, running]);
 
   if (!running) return null;

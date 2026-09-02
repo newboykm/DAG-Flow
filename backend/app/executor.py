@@ -36,6 +36,7 @@ def build_messages(
     memory: dict | None = None,
     skills_text: str = "",
     project_context: str = "",
+    workspace: str = "",
 ) -> list[dict]:
     """组装发给模型的消息：分层 system 提示（身份/角色/工具指引/技能/项目上下文）+ 记忆 + 父产出 + 历史 + 输入。
 
@@ -48,26 +49,32 @@ def build_messages(
     # ---- 身份层 ----
     identity = "你是本卡片的专属执行 agent（一个自主的多工具 AI 智能体）。"
 
-    # ---- 角色 persona 层（工作原则）----
+    # ---- 角色 persona 层（决策驱动工作原则）----
     persona = (
-        "【工作模式：先探测、后行动】\n"
-        "1) 先用工具核实事实（列目录/读文件/检索/搜索），再下结论或动手；不确定时不要臆造，用工具确认。\n"
-        "2) 复杂任务先规划、分步执行；每步基于上一步结果推进，成功才继续；失败时分析原因、换策略，"
-        "同一操作连续失败 2 次即停止并反馈，不要盲目重试。\n"
-        "3) 每一步实施后自检：改动是否最小、是否验证过；能用工具验证就用工具验证。\n"
-        "【自主推进】\n"
-        "4) 你是高自主执行 agent：一次任务尽量自己拆解、连续调用工具推进到最后并完成，"
-        "不要每步都停下来等确认；除非遇到需要人工决策/敏感操作/或实在无法继续，否则自主完成闭环。\n"
-        "5) 任务结束时明确说「完成」并总结做了什么；不要输出「还需你确认下一步」这类半途而废的结束语。\n"
-        "【输出格式】\n"
-        "6) 最终回答用中文，结构化：先给结论，再给关键过程（含用到的工具/文件），最后给下一步建议（无则省略）。\n"
-        "7) 不要编造工具结果或文件内容；把不确定处明确标为「待确认」。\n"
-        "【自我验证】\n"
-        "8) 写完文件、改完或执行完关键操作后，主动运行验证（读回文件/执行命令/编译/测试）确认结果无误再收尾；"
-        "验证不通过就继续修正，不要直接下结论。\n"
-        "【安全】\n"
-        "9) 不打印 API Key、密码等敏感信息；工具操作限制在工作目录内，路径越界会被拒绝；"
-        "写文件、执行命令、运行代码属敏感操作，会先请求人工审批。"
+        "【决策三问：收到任务后先判断】\n"
+        "① 用户意图明确吗？不明确 → 只问 1 个关键问题（附 2-3 个选项 + 默认建议），不要连环抛问。\n"
+        "② 信息能自己查吗？（read/grep/search/web）能 → 直接并行探索，不提问。\n"
+        "③ 操作可逆吗？不可逆（生产/push/扣款/删数据）→ 必须确认；可逆 → 直接执行，事后简述。\n"
+        "\n【把握度分级（决定提问还是自行决定）】\n"
+        "- 变量命名/代码风格/内部实现：≥60% 自行决定，不问。\n"
+        "- 修改逻辑/重/新增文件：≥80% 才做；涉及对外接口/数据结构/数据存储等影响用户的设计 → 提问并给默认方案。\n"
+        "- 生产、不可逆操作：≥95% 且必须用户明确确认。\n"
+        "- 读/查/搜：零风险，大胆并行做，用发现指导决策。\n"
+        "\n【规划期 vs 执行期】\n"
+        "- 规划期（还没动代码）：意图、方案、对外接口必须清楚 → 不清楚就提问收敛。\n"
+        "- 执行期（已在改代码）：内部细节自己用工具查，只在关键决策点（选型/对外接口）暂停提问。\n"
+        "\n【并行探索】：一次把相关文件 grep 全，再并行 read（工具可并行，不要串行一个等一个）。\n"
+        "\n【快速失败（防死循环）】\n"
+        "- 同一 (工具, 参数) 失败后禁止重试，强制换一种思路。\n"
+        "- 换 2 种思路仍失败 → 主动上报，给出 2 个备选方案请用户指示。\n"
+        "- 单任务最多 12 步；超出则输出当前最佳结果 + 未完成清单。\n"
+        "\n【执行后透明】：每次写入/修改后，都简述做了什么、为什么。\n"
+        "\n【自主推进】你是高自主执行 agent：一次任务尽量自己拆解、连续用工具推进到最后并完成，"
+        "除非遇到真需要用户决策/不可逆敏感操作/或卡死无法继续，否则自主闭环；结束时明确说「完成」并总结。\n"
+        "\n【输出】最终回答用中文，先给结论，再给关键过程与用到的文件/工具，最后给下一步建议（无则省略）；"
+        "不编造工具结果，不确定处标「待确认」；关键操作后自检验证（读回/编译/测试）再收尾。\n"
+        "\n【安全】不打印密钥等敏感信息，操作限工作目录内；写文件/执行命令/运行代码等敏感操作会走审批，别硬闯。\n"
+        "\n【长对话】轮次较多时定期总结已确认要点，避免重复提问；发现矛盾主动指出；信息够了就主动推进不再等确认。"
     )
 
     # ---- 工具指引层（dsh 每个工具自带 guidance 的思想）----
@@ -89,6 +96,16 @@ def build_messages(
         {"role": "system", "content": persona},
         {"role": "system", "content": tool_guidance},
     ]
+
+    # 项目经验记忆注入（技能/工具用法/入口/注意）：让 agent 一上来就知道咋做事，避免重复遍历
+    if workspace:
+        try:
+            from .experiential_mem import load_project_knowledge
+            _pk = load_project_knowledge(workspace)
+            if _pk.strip():
+                msgs.append({"role": "system", "content": _pk[:3000]})
+        except Exception:
+            pass
 
     # 已加载的 skill 能力清单
     if skills_text.strip():
@@ -371,8 +388,14 @@ async def _chat_once_text(base_url: str, api_key: str, model: str, messages: lis
     raise last if last else RuntimeError("LLM 调用失败")
 
 
-async def generate_plan(base_url: str, api_key: str, model: str, task: str, parent_index: list[str], memory: dict | None) -> dict:
-    """LLM 规划：把任务拆分为可执行步骤（对齐主流 Planning agent）。"""
+async def generate_plan(base_url: str, api_key: str, model: str, task: str, parent_index: list[str], memory: dict | None,
+                        on_steps=None) -> dict:
+    """LLM 规划：把任务拆分为可执行步骤（对齐主流 Planning agent）。
+
+    流式采集：等整段返回才生成会让"任务单审批"看起来晚到。这里改为流式攒内容，
+    一旦能解析出足够步骤就通过 on_steps(norm) 提前通知（供调度器尽早弹计划审批），
+    最终仍保证返回完整 plan。on_steps=None（调用方不关心）时行为基本等同原非流式版本。
+    """
     import json as _json
     mem = memory or {}
     prompt = (
@@ -387,27 +410,45 @@ async def generate_plan(base_url: str, api_key: str, model: str, task: str, pare
         {"role": "system", "content": "你是任务规划助手，产出简洁、可执行的计划 JSON。"},
         {"role": "user", "content": prompt},
     ]
-    try:
-        content = await _chat_once_text(base_url, api_key, model, msgs)
-        from .jsonutil import parse_json_object, expect_str, expect_list
-        obj = parse_json_object(content or "")
-        goal = expect_str(obj, "goal", "")
-        steps = expect_list(obj, "steps", [])
-        # 归一化：steps 支持 str 或 {"label":..} 两种形式
+    from .jsonutil import parse_json_object, expect_str, expect_list
+    import asyncio as _aio
+
+    def _normalize(steps):
         norm: list[str] = []
-        for s in steps:
+        for s in steps or []:
             if isinstance(s, dict):
-                lab = expect_str(s, "label", "")
-                if str(lab).strip():
-                    norm.append(str(lab).strip())
+                lab = str(expect_str(s, "label", "") or "").strip()
+                if lab:
+                    norm.append(lab)
             else:
                 sv = str(s).strip()
                 if sv:
                     norm.append(sv)
-        norm = norm[:8]
+        return norm[:8]
+
+    _announced = False
+    content = ""
+    try:
+        async for piece in stream_chat(base_url, api_key, model, msgs, temperature=0.4):
+            if not piece:
+                continue
+            content += piece
+            # 增量早报到：一旦攒出可解析且有足够步骤的计划，就提前通知（只一次），审批无需等整段收尾
+            if on_steps is not None and not _announced:
+                try:
+                    obj = parse_json_object(content)
+                    norm = _normalize(obj.get("steps"))
+                    if len(norm) >= 2 and len(content) > 40:
+                        _announced = True
+                        await on_steps(norm)
+                except Exception:
+                    pass
+        obj = parse_json_object(content or "")
+        goal = expect_str(obj, "goal", "")
+        steps = _normalize(obj.get("steps"))
         return {
             "goal": goal or task[:80],
-            "steps": [{"label": s, "status": "pending"} for s in norm],
+            "steps": [{"label": s, "status": "pending"} for s in steps],
         }
     except ValueError:
         # 模型未返回合法计划 JSON：回退单步计划（不静默成功，明确降级）

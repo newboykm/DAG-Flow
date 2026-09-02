@@ -630,6 +630,68 @@ async def _publish_exec_event(db, node: Node) -> None:
         pass
 
 
+async def _record_experiential(db, node: Node, workspace: str, provider=None, provider_model: str = "") -> dict:
+    """项目经验自动回写（确定性、零污染、不阻塞）。
+
+    从本次执行抽取"有把握"的经验写入项目记忆，避免下次重复遍历工具/代码：
+    - skills_usage：本次实际调用了哪些工具（event_log 真实工具集）
+    - entry_points : 本次产出里明确提到的项目文件路径（触碰过的关键位置）
+    不猜坑/不猜结论，所以不会注入错误经验。
+    """
+    from . import experiential_mem as xmem
+    added = {"skills_usage": 0, "entry_points": 0, "lessons": 0}
+    try:
+        from . import event_log
+        events = event_log.EventLog(node.sessionId, node.nodeId).latest_run_events()
+        tools = []
+        for e in events:
+            if e.get("kind") == "tool_call":
+                t = e.get("tool")
+                if t and t not in tools and not t.startswith("mcp__"):
+                    tools.append(t)
+        if tools:
+            recorded = ", ".join(tools)
+            xmem.record_line(workspace, "skills_usage",
+                             f"任务「{str(node.title or '')[:40]}」用到的工具：{recorded}")
+            added["skills_usage"] += 1
+
+        # 触碰过的项目文件（从产出里出现的代码文件路径）
+        html = (node.output or {}).get("content") or ""
+        found = {}
+        import re as _re
+        if isinstance(html, str):
+            for m in _re.finditer(r"[\w./\\-]+\.(py|ts|tsx|js|jsx|md|json|ya?ml|sh|sql|c|cpp|h|java|go|rs)\b", html):
+                p = m.group(0)
+                key = p.replace("\\", "/")
+                if key and not key.startswith((".", "/", "http")) and "/" not in key:
+                    key = key
+                found.setdefault(key, None)
+        real = [p for p in found if p and os.path.exists(os.path.join(workspace, p))]
+        if real[:6]:
+            xmem.record_line(workspace, "entry_points",
+                             f"任务「{str(node.title or '')[:40]}」涉及文件：{', '.join(real[:6])}")
+            added["entry_points"] += 1
+    except Exception:
+        pass
+
+    # 过滤式收获沉淀：让模型反思并沉淀"可复用"经验（skill/入口/坑）；失败静默
+    if provider is not None:
+        try:
+            from .experiential_mem import reflect_and_sink
+            base = (provider.baseUrl or "").rstrip("/")
+            key = provider.pick_api_key() if hasattr(provider, "pick_api_key") else ""
+            n = await reflect_and_sink(
+                workspace, str(node.title or ""),
+                tools if "tools" in dir() else [], real if "real" in dir() else [],
+                base, key or "", provider_model,
+            )
+            if n:
+                added["lessons"] = max(added.get("lessons", 0), n)
+        except Exception:
+            pass
+    return added
+
+
 async def _run_real(node_id: str) -> None:
     """用真实模型流式执行一个节点：逐步写入 messages/progress，完成后 done + 发布上下文。"""
     db = SessionLocal()
@@ -705,7 +767,7 @@ async def _run_real(node_id: str) -> None:
         except Exception:
             project_context = ""
 
-        messages = build_messages(node.title, user_text, history, parent_outputs, node.memory, skills_text, project_context)
+        messages = build_messages(node.title, user_text, history, parent_outputs, node.memory, skills_text, project_context, workspace)
 
         # 若为重试/继续（存在上一轮事件日志且非空），从上一轮事件重建"前情摘要"，
         # 注入上下文，让 agent 基于上次进展和失败点继续，而不是盲目重来。
@@ -776,10 +838,43 @@ async def _run_real(node_id: str) -> None:
             pass
         tool_ctx = {"sessionId": node.sessionId, "parentIds": node.parentIds or []}
 
+        # ---- 计划审批前置：流式生成计划时"尽早"弹审批，不必等整段计划收尾 ----
+        _plan_appr_done = False       # 审批是否已 request 过（防重复弹）
+        _abort_by_approval = False    # 用户拒绝→中断本轮执行
+
+        async def _early_plan_approval(steps_part: list[str]) -> None:
+            nonlocal _plan_appr_done, _abort_by_approval
+            if _plan_appr_done:
+                return
+            # 用已解析出的步骤预判是否需计划审批（复用判据：步骤≥3 或 user_text 含敏感词）
+            pseudo = {"steps": [{"label": s, "status": "pending"} for s in steps_part]}
+            if not _task_needs_plan_approval(pseudo, user_text) or not steps_part:
+                return
+            _plan_appr_done = True
+            steps_text = "\n".join(f"- {s}" for s in steps_part)
+            summary = f"任务计划（{len(steps_part)} 步）：\n{steps_text}"
+            ap = await _request_approval(db, node, "plan", {"plan": summary[:2000]})
+            decision = await _wait_approval(db, ap.id)
+            if decision == "rejected":
+                await _settle_approval(db, ap.id)
+                _abort_by_approval = True
+                await publish(
+                    node.sessionId,
+                    {"type": "node_update", "nodeId": node.nodeId, "status": "failed",
+                     "plan": {"goal": "", "steps": [{"label": s, "status": "pending"} for s in steps_part]},
+                     "messages": node.messages, "planRejected": True},
+                )
+            else:
+                await publish(
+                    node.sessionId,
+                    {"type": "node_update", "nodeId": node.nodeId, "planApproved": True},
+                )
+
         # 生成执行计划并推送前端（对齐主流 Planning agent）
         node.plan = await generate_plan(
             cfg_base, provider.pick_api_key(), provider_model,
             user_text, parent_outputs, node.memory,
+            on_steps=_early_plan_approval,
         )
         db.commit()
         await publish(
@@ -792,7 +887,22 @@ async def _run_real(node_id: str) -> None:
                 "messages": node.messages,
             },
         )
-        await _maybe_plan_approval(db, node, user_text, messages, provider, provider_model)
+        if _abort_by_approval:
+            # 用户拒绝计划并给了原因 ->停止执行该节点
+            from .models import Session as _Sess
+            _sn = db.get(_Sess, node.sessionId)
+            try:
+                node.status = "failed"
+                node.output = {"type": "text", "summary": "用户拒绝执行该任务计划", "content": "任务已被用户拒绝,未执行。", "artifacts": []}
+                db.commit()
+                await publish(node.sessionId, {"type": "node_update", "nodeId": node.nodeId, "status": "failed",
+                                               "output": node.output})
+                return
+            except Exception:
+                pass
+        # 未在流式阶段早弹、但最终计划满足判据(如非敏感但≥3步)的任务：仍按原机制确认一次
+        if not _plan_appr_done:
+            await _maybe_plan_approval(db, node, user_text, messages, provider, provider_model)
 
         # 确保存在一条 assistant 占位
         msgs = list(node.messages or [])
@@ -944,8 +1054,10 @@ async def _run_real(node_id: str) -> None:
         acc = ""
         total_prompt = 0
         total_completion = 0
-        max_rounds = 25
+        max_rounds = 15  # 收敛优先：多数任务 15 轮内足够，避免无谓 LLM 往返
         fail_counts: dict[str, int] = {}
+        rounding_stall = 0  # 连续"无效轮"计数，≥2 提前收尾防空转
+        pending_tool_ids = 0
 
         def is_failure(result: str) -> bool:
             s = (result or "").strip()
@@ -1321,11 +1433,14 @@ async def _run_real(node_id: str) -> None:
         final_plan["steps"] = steps
         node.plan = final_plan
 
-        # 更新卡片滚动记忆（每次完成用 LLM 折叠，避免失忆 + 控制 token）
+        # 更新卡片滚动记忆：仅当确有较多内容时用 LLM 折叠（省一次额外请求，提速短任务）
+        # 短任务/输出少时跳过压缩，直接在失败/无文本时也无损。
         try:
-            new_memory = await _rolling_memory(provider, provider_model, node.memory, user_text, final_text)
-            if new_memory:
-                node.memory = new_memory
+            _should_roll = int(total_completion or 0) > 800 or ((node.messages or []).__len__() > 20)
+            if _should_roll:
+                new_memory = await _rolling_memory(provider, provider_model, node.memory, user_text, final_text)
+                if new_memory:
+                    node.memory = new_memory
         except Exception:
             pass
 
@@ -1360,6 +1475,12 @@ async def _run_real(node_id: str) -> None:
                                                "status": "running", "memory": node.memory, "messages": node.messages, "goalContinuation": _round})
                 _real_exec_tasks.pop(node_id, None)
                 return
+
+        # 成功收尾时：把本次的经验（工具用法/涉及文件）自动回写到项目级记忆，供下次任务按需加载
+        try:
+            await _record_experiential(db, node, workspace)
+        except Exception:
+            pass
 
         node.status = "done"
         node.output = {

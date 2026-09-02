@@ -7,6 +7,7 @@ import MarkdownBlock from './MarkdownBlock';
 import TrustLevelPicker from './TrustLevelPicker';
 import ExecTimeline from './ExecTimeline';
 import ExecLivePreview from './ExecLivePreview';
+import CopyBtn from './CopyBtn';
 import type { AppendMode, DagNode } from '../types';
 
 const MODE_LABEL: Record<AppendMode, string> = { serial: '串行', parallel: '并行', join: 'join' };
@@ -538,17 +539,8 @@ export default function TaskNodeCard(props: Props) {
                         <div className="chat-msg chat-user">
                           <div className="chat-bubble-wrap">
                             <div className="chat-bubble">{g.user.text}</div>
-                            {/* 用户消息的一键复制：放在消息框外面 */}
-                            <button
-                              className="copy-btn"
-                              title="复制"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (g.user.text) navigator.clipboard?.writeText(g.user.text);
-                              }}
-                            >
-                              ⧉
-                            </button>
+                            {/* 用户消息的一键复制（点击变对号反馈）：放在消息框外面 */}
+                            <CopyBtn text={g.user.text ?? ''} className="copy-btn" />
                           </div>
                         </div>
                       ) : null}
@@ -567,17 +559,7 @@ export default function TaskNodeCard(props: Props) {
                                   {r.streaming ? <span className="chat-cursor">▍</span> : null}
                                 </div>
                               ))}
-                              <button
-                                className="copy-btn"
-                                title="复制"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const all = g.replies.map((r) => r.text).join('\n');
-                                  if (all) navigator.clipboard?.writeText(all);
-                                }}
-                              >
-                                ⧉
-                              </button>
+                              <CopyBtn text={g.replies.map((r) => r.text).join('\n')} className="copy-btn" />
                             </div>
                           </div>
                         </div>

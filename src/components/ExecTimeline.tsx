@@ -5,6 +5,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
+import { onExecEvent } from '../store/useGraphStore';
 
 interface Ev {
   kind: string;
@@ -47,8 +48,13 @@ export default function ExecTimeline({
     if (running) {
       timer.current = window.setInterval(load, 2000);
     }
+    // 订阅 WS 实时 exec_event：匹配节点的事件到达即立刻刷新，无需等轮询
+    const unsub = onExecEvent((e) => {
+      if (e && (e.nodeId === nodeId || e.nodeId === undefined)) load();
+    });
     return () => {
       alive = false;
+      unsub();
       if (timer.current) window.clearInterval(timer.current);
     };
   }, [nodeId, running, refreshKey]);
